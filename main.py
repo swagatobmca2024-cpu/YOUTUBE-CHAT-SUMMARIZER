@@ -216,6 +216,16 @@ with st.sidebar:
     except (KeyError, FileNotFoundError):
         st.error("Add GEMINI_API_KEY to .streamlit/secrets.toml", icon="⚠")
 
+    # ── Webshare proxy credentials (required on Streamlit Cloud) ─────────────
+    proxy_user: str | None = None
+    proxy_pass: str | None = None
+    try:
+        proxy_user = st.secrets["WEBSHARE_USER"]
+        proxy_pass = st.secrets["WEBSHARE_PASS"]
+        st.success("Proxy loaded ✓", icon="🌐")
+    except (KeyError, FileNotFoundError):
+        st.warning("No proxy set — may fail on cloud.", icon="⚠")
+
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
     st.markdown("**Settings**")
 
@@ -336,6 +346,8 @@ if run:
             video_id,
             include_timestamps=include_timestamps,
             cookies_txt=cookies_txt,
+            proxy_user=proxy_user,
+            proxy_pass=proxy_pass,
         )
 
     if transcript_error:
