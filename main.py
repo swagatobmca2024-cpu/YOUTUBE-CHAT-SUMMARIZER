@@ -1,10 +1,18 @@
 """
-main.py — YouTube Q&A Bot (Gemini Edition)
-==========================================
-Chat with any YouTube video. Powered by Gemini 2.0 Flash + Google Embeddings + FAISS.
+main.py — YouTube Video Summarizer & Q&A Bot
+=============================================
+Powered by Gemini 2.0 Flash · Dark Themed · Multilingual
 
-Deploy:  streamlit run main.py
-Cloud:   share.streamlit.io  →  set GEMINI_API_KEY in Secrets
+Features:
+  - Full video summarization with timestamps
+  - RAG-based Q&A chat
+  - Multilingual output support
+  - Multiple summary styles
+  - Clickable timestamp links
+  - Chat history with export
+
+Run:
+    streamlit run main.py
 """
 
 import streamlit as st
@@ -13,608 +21,605 @@ from utils import (
     fetch_transcript,
     build_vector_store,
     get_answer,
+    summarize_video,
+    get_available_languages,
     format_timestamp,
-    estimate_duration,
 )
 
-# ── Page Config ───────────────────────────────────────────────────────────────
+# ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="YT Q&A · Gemini",
+    page_title="YT Summarizer & Q&A",
     page_icon="🎬",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Advanced Dark Theme CSS ───────────────────────────────────────────────────
+# ── Dark Theme CSS ─────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&family=Manrope:wght@300;400;600;800&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@300;400;500;600&display=swap');
 
-/* ── Root Variables ── */
-:root {
-    --bg-base:       #080b10;
-    --bg-surface:    #0d1117;
-    --bg-elevated:   #161b22;
-    --bg-hover:      #1c2130;
-    --border:        #21262d;
-    --border-accent: #30363d;
-    --text-primary:  #e6edf3;
-    --text-secondary:#8b949e;
-    --text-muted:    #484f58;
-    --accent-red:    #ff4d4d;
-    --accent-amber:  #f0a500;
-    --accent-teal:   #39d0d8;
-    --accent-blue:   #58a6ff;
-    --gem-from:      #4285f4;
-    --gem-to:        #0f9d58;
-    --radius-sm:     6px;
-    --radius-md:     10px;
-    --radius-lg:     16px;
-}
+    /* Global dark background */
+    html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"] {
+        background-color: #0d0d0d !important;
+        color: #e8e8e8 !important;
+        font-family: 'Inter', sans-serif;
+    }
 
-/* ── Global Reset ── */
-html, body, [class*="css"] {
-    font-family: 'Manrope', sans-serif !important;
-    background-color: var(--bg-base) !important;
-    color: var(--text-primary) !important;
-}
+    [data-testid="stSidebar"] {
+        background-color: #111111 !important;
+        border-right: 1px solid #222 !important;
+    }
 
-/* ── Hide Streamlit Defaults ── */
-#MainMenu, footer, header { visibility: hidden; }
-.block-container { padding: 1.5rem 2rem 4rem !important; max-width: 1100px; }
+    [data-testid="stSidebar"] * {
+        color: #e8e8e8 !important;
+    }
 
-/* ── Sidebar ── */
-section[data-testid="stSidebar"] {
-    background: var(--bg-surface) !important;
-    border-right: 1px solid var(--border) !important;
-    padding-top: 1rem;
-}
-section[data-testid="stSidebar"] .block-container {
-    padding: 1rem !important;
-}
+    /* Header */
+    .yt-header {
+        background: linear-gradient(135deg, #1a0a0a 0%, #0d0d0d 50%, #0a0a1a 100%);
+        border: 1px solid #2a2a2a;
+        border-radius: 16px;
+        padding: 28px 32px;
+        margin-bottom: 24px;
+        position: relative;
+        overflow: hidden;
+    }
+    .yt-header::before {
+        content: '';
+        position: absolute;
+        top: 0; left: 0; right: 0;
+        height: 2px;
+        background: linear-gradient(90deg, #ff0000, #ff4444, #ff0000);
+    }
+    .yt-header h1 {
+        font-family: 'Space Mono', monospace;
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #ffffff;
+        margin: 0 0 6px 0;
+        letter-spacing: -0.5px;
+    }
+    .yt-header p {
+        color: #888;
+        font-size: 0.88rem;
+        margin: 0;
+        font-weight: 300;
+    }
+    .yt-badge {
+        display: inline-block;
+        background: #ff0000;
+        color: white;
+        font-size: 10px;
+        font-weight: 700;
+        font-family: 'Space Mono', monospace;
+        padding: 3px 8px;
+        border-radius: 4px;
+        letter-spacing: 1px;
+        margin-right: 8px;
+        vertical-align: middle;
+    }
+    .gemini-badge {
+        display: inline-block;
+        background: linear-gradient(90deg, #4285f4, #34a853);
+        color: white;
+        font-size: 10px;
+        font-weight: 700;
+        font-family: 'Space Mono', monospace;
+        padding: 3px 8px;
+        border-radius: 4px;
+        letter-spacing: 0.5px;
+        vertical-align: middle;
+    }
 
-/* ── Custom Header ── */
-.app-header {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    margin-bottom: 0.25rem;
-    padding-bottom: 1.25rem;
-    border-bottom: 1px solid var(--border);
-}
-.app-logo {
-    width: 42px;
-    height: 42px;
-    background: linear-gradient(135deg, var(--accent-red), #ff2d2d);
-    border-radius: 10px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 22px;
-    flex-shrink: 0;
-    box-shadow: 0 0 20px rgba(255,77,77,0.3);
-}
-.app-title {
-    font-family: 'Manrope', sans-serif;
-    font-weight: 800;
-    font-size: 1.55rem;
-    color: var(--text-primary);
-    line-height: 1.1;
-}
-.app-subtitle {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.72rem;
-    color: var(--text-muted);
-    margin-top: 2px;
-    letter-spacing: 0.04em;
-}
-.gem-badge {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.68rem;
-    font-weight: 600;
-    color: var(--gem-from);
-    background: rgba(66,133,244,0.1);
-    border: 1px solid rgba(66,133,244,0.25);
-    border-radius: 20px;
-    padding: 2px 10px;
-    display: inline-block;
-    letter-spacing: 0.05em;
-}
+    /* Video meta card */
+    .video-meta {
+        background: #141414;
+        border: 1px solid #222;
+        border-left: 3px solid #ff0000;
+        border-radius: 10px;
+        padding: 14px 18px;
+        font-size: 13px;
+        margin-bottom: 20px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }
+    .video-meta a {
+        color: #aaa;
+        text-decoration: none;
+    }
+    .video-meta a:hover { color: #ff4444; }
+    .chunk-count {
+        background: #1e1e1e;
+        color: #666;
+        font-size: 11px;
+        padding: 3px 10px;
+        border-radius: 20px;
+        font-family: 'Space Mono', monospace;
+        margin-left: auto;
+    }
 
-/* ── Sidebar Section Labels ── */
-.sidebar-label {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.68rem;
-    color: var(--text-muted);
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    margin: 1.2rem 0 0.5rem 0;
-    padding-bottom: 4px;
-    border-bottom: 1px solid var(--border);
-}
+    /* Tabs styling */
+    [data-testid="stTabs"] button {
+        font-family: 'Space Mono', monospace !important;
+        font-size: 13px !important;
+        color: #666 !important;
+        background: transparent !important;
+        border: none !important;
+        padding: 10px 20px !important;
+    }
+    [data-testid="stTabs"] button[aria-selected="true"] {
+        color: #ffffff !important;
+        border-bottom: 2px solid #ff0000 !important;
+    }
 
-/* ── Video Meta Card ── */
-.video-card {
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 14px 16px;
-    margin-bottom: 1.25rem;
-    display: flex;
-    align-items: center;
-    gap: 14px;
-}
-.video-thumb {
-    width: 80px;
-    height: 56px;
-    border-radius: var(--radius-sm);
-    object-fit: cover;
-    flex-shrink: 0;
-    border: 1px solid var(--border-accent);
-}
-.video-info {
-    flex: 1;
-    min-width: 0;
-}
-.video-url {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.75rem;
-    color: var(--accent-blue);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.video-stats {
-    display: flex;
-    gap: 10px;
-    margin-top: 6px;
-    flex-wrap: wrap;
-}
-.stat-pill {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.68rem;
-    color: var(--text-secondary);
-    background: var(--bg-hover);
-    border: 1px solid var(--border-accent);
-    border-radius: 20px;
-    padding: 2px 9px;
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-}
+    /* Summary output box */
+    .summary-box {
+        background: #111;
+        border: 1px solid #222;
+        border-radius: 12px;
+        padding: 24px 28px;
+        font-size: 14px;
+        line-height: 1.8;
+        color: #ddd;
+        white-space: pre-wrap;
+    }
 
-/* ── Chat Messages ── */
-.stChatMessage {
-    background: transparent !important;
-    border: none !important;
-    padding: 0.3rem 0 !important;
-}
-[data-testid="stChatMessageContent"] {
-    background: var(--bg-elevated) !important;
-    border: 1px solid var(--border) !important;
-    border-radius: var(--radius-md) !important;
-    padding: 14px 18px !important;
-    font-size: 0.95rem !important;
-    line-height: 1.7 !important;
-    color: var(--text-primary) !important;
-}
-[data-testid="stChatMessage"][data-role="user"] [data-testid="stChatMessageContent"] {
-    background: var(--bg-hover) !important;
-    border-color: var(--border-accent) !important;
-}
+    /* Timestamp badge */
+    .ts-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        background: #1a1a1a;
+        border: 1px solid #333;
+        color: #ff4444;
+        font-size: 11px;
+        padding: 4px 10px;
+        border-radius: 20px;
+        margin: 3px 3px 0 0;
+        font-family: 'Space Mono', monospace;
+        text-decoration: none;
+        transition: all 0.2s;
+    }
+    .ts-badge:hover {
+        background: #ff0000;
+        color: white;
+        border-color: #ff0000;
+    }
 
-/* ── Timestamp Badges ── */
-.ts-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    background: var(--bg-elevated);
-    border: 1px solid var(--border-accent);
-    border-radius: 6px;
-    padding: 4px 10px;
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.75rem;
-    color: var(--accent-teal);
-    text-decoration: none;
-    transition: all 0.15s ease;
-    margin: 3px;
-}
-.ts-badge:hover {
-    background: rgba(57,208,216,0.1);
-    border-color: var(--accent-teal);
-    color: var(--accent-teal);
-}
-.ts-section-label {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.68rem;
-    color: var(--text-muted);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    margin-top: 10px;
-    margin-bottom: 4px;
-}
+    /* Chat messages */
+    [data-testid="stChatMessage"] {
+        background: #111 !important;
+        border: 1px solid #1e1e1e !important;
+        border-radius: 12px !important;
+        margin-bottom: 8px !important;
+    }
 
-/* ── Input ── */
-.stTextInput > div > div > input,
-.stChatInputContainer textarea {
-    background: var(--bg-elevated) !important;
-    border: 1px solid var(--border-accent) !important;
-    border-radius: var(--radius-md) !important;
-    color: var(--text-primary) !important;
-    font-family: 'Manrope', sans-serif !important;
-    font-size: 0.9rem !important;
-}
-.stChatInputContainer {
-    background: var(--bg-surface) !important;
-    border-top: 1px solid var(--border) !important;
-    padding-top: 0.75rem !important;
-}
+    /* Chat input */
+    [data-testid="stChatInputTextArea"] {
+        background: #141414 !important;
+        border: 1px solid #2a2a2a !important;
+        color: #e8e8e8 !important;
+        border-radius: 10px !important;
+    }
 
-/* ── Selectbox ── */
-.stSelectbox > div > div {
-    background: var(--bg-elevated) !important;
-    border: 1px solid var(--border-accent) !important;
-    border-radius: var(--radius-sm) !important;
-    color: var(--text-primary) !important;
-}
+    /* Input fields */
+    [data-testid="stTextInput"] input,
+    [data-testid="stSelectbox"] select {
+        background: #141414 !important;
+        border: 1px solid #2a2a2a !important;
+        color: #e8e8e8 !important;
+        border-radius: 8px !important;
+    }
 
-/* ── Primary Button ── */
-.stButton > button[kind="primary"] {
-    background: linear-gradient(135deg, #ff4d4d 0%, #cc2200 100%) !important;
-    border: none !important;
-    border-radius: var(--radius-sm) !important;
-    color: white !important;
-    font-family: 'Manrope', sans-serif !important;
-    font-weight: 700 !important;
-    font-size: 0.9rem !important;
-    letter-spacing: 0.02em !important;
-    padding: 0.55rem 1.5rem !important;
-    width: 100% !important;
-    transition: opacity 0.2s, transform 0.1s !important;
-    box-shadow: 0 0 18px rgba(255,77,77,0.2) !important;
-}
-.stButton > button[kind="primary"]:hover {
-    opacity: 0.88 !important;
-    transform: translateY(-1px) !important;
-}
-.stButton > button[kind="secondary"] {
-    background: var(--bg-elevated) !important;
-    border: 1px solid var(--border-accent) !important;
-    border-radius: var(--radius-sm) !important;
-    color: var(--text-secondary) !important;
-    font-family: 'Manrope', sans-serif !important;
-    font-size: 0.85rem !important;
-    width: 100% !important;
-}
+    /* Buttons */
+    [data-testid="stButton"] button[kind="primary"] {
+        background: #ff0000 !important;
+        border: none !important;
+        color: white !important;
+        font-family: 'Space Mono', monospace !important;
+        font-size: 13px !important;
+        border-radius: 8px !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.5px !important;
+    }
+    [data-testid="stButton"] button[kind="primary"]:hover {
+        background: #cc0000 !important;
+    }
+    [data-testid="stButton"] button[kind="secondary"] {
+        background: #1a1a1a !important;
+        border: 1px solid #333 !important;
+        color: #aaa !important;
+        border-radius: 8px !important;
+    }
 
-/* ── Alert / Info ── */
-.stAlert {
-    background: var(--bg-elevated) !important;
-    border: 1px solid var(--border-accent) !important;
-    border-radius: var(--radius-md) !important;
-    color: var(--text-secondary) !important;
-}
+    /* Info / success / error boxes */
+    [data-testid="stAlert"] {
+        background: #141414 !important;
+        border-radius: 8px !important;
+        border: 1px solid #2a2a2a !important;
+    }
 
-/* ── Labels ── */
-label, .stSelectbox label {
-    color: var(--text-secondary) !important;
-    font-family: 'IBM Plex Mono', monospace !important;
-    font-size: 0.72rem !important;
-    letter-spacing: 0.05em !important;
-}
+    /* Selectbox */
+    [data-testid="stSelectbox"] > div > div {
+        background: #141414 !important;
+        border: 1px solid #2a2a2a !important;
+        color: #e8e8e8 !important;
+    }
 
-/* ── Divider ── */
-hr { border-color: var(--border) !important; margin: 0.75rem 0 !important; }
+    /* Sidebar sections */
+    .sidebar-section {
+        background: #1a1a1a;
+        border: 1px solid #222;
+        border-radius: 10px;
+        padding: 14px;
+        margin-bottom: 14px;
+    }
+    .sidebar-label {
+        font-family: 'Space Mono', monospace;
+        font-size: 10px;
+        color: #555;
+        letter-spacing: 1.5px;
+        text-transform: uppercase;
+        margin-bottom: 10px;
+    }
 
-/* ── Spinner ── */
-.stSpinner > div { border-top-color: var(--accent-teal) !important; }
+    /* Stats row */
+    .stat-card {
+        background: #141414;
+        border: 1px solid #1e1e1e;
+        border-radius: 8px;
+        padding: 12px 16px;
+        text-align: center;
+    }
+    .stat-value {
+        font-family: 'Space Mono', monospace;
+        font-size: 1.4rem;
+        font-weight: 700;
+        color: #ff4444;
+    }
+    .stat-label {
+        font-size: 11px;
+        color: #555;
+        margin-top: 2px;
+    }
 
-/* ── Empty state ── */
-.empty-state {
-    text-align: center;
-    padding: 3rem 2rem;
-    color: var(--text-muted);
-}
-.empty-icon {
-    font-size: 3rem;
-    margin-bottom: 1rem;
-    opacity: 0.5;
-}
-.empty-title {
-    font-family: 'Manrope', sans-serif;
-    font-weight: 600;
-    font-size: 1.1rem;
-    color: var(--text-secondary);
-    margin-bottom: 0.5rem;
-}
-.empty-desc {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.78rem;
-    color: var(--text-muted);
-    line-height: 1.7;
-}
+    /* Divider */
+    hr { border-color: #1e1e1e !important; }
 
-/* ── How it works steps ── */
-.how-step {
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    margin-bottom: 10px;
-    font-size: 0.82rem;
-    color: var(--text-secondary);
-    font-family: 'Manrope', sans-serif;
-}
-.step-num {
-    width: 20px;
-    height: 20px;
-    background: var(--bg-hover);
-    border: 1px solid var(--border-accent);
-    border-radius: 50%;
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.65rem;
-    color: var(--accent-teal);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    margin-top: 1px;
-}
+    /* Hide Streamlit default elements */
+    #MainMenu, footer, header { visibility: hidden; }
+    .stDeployButton { display: none; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Session State Init ────────────────────────────────────────────────────────
+# ── Session state init ─────────────────────────────────────────────────────────
+
+# Auto-load Gemini key from Streamlit secrets if available
+_default_key = ""
+try:
+    _default_key = st.secrets.get("GEMINI_API_KEY", "")
+except Exception:
+    pass
+
 defaults = {
     "messages": [],
     "vector_store": None,
     "video_id": None,
     "transcript_chunks": [],
     "video_loaded": False,
-    "gemini_key": "",
-    "model_choice": "gemini-2.0-flash",
-    "chunk_count": 0,
-    "video_duration": "—",
+    "summary": None,
+    "gemini_key": _default_key,
+    "available_langs": [],
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── Header ─────────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="yt-header">
+    <h1>
+        <span class="yt-badge">YT</span>
+        Summarizer & Q&amp;A
+        <span class="gemini-badge">Gemini 2.0 Flash</span>
+    </h1>
+    <p>Paste any YouTube link · Get a timestamped summary · Chat with the video · Any language</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("""
-    <div class="app-header">
-        <div class="app-logo">▶</div>
-        <div>
-            <div class="app-title">YT Q&amp;A Bot</div>
-            <div class="app-subtitle">GEMINI · RAG · FAISS</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── API Key ──
-    st.markdown('<div class="sidebar-label">🔑 API Key</div>', unsafe_allow_html=True)
-
-    # Try to load from Streamlit secrets first (for cloud deployment)
-    default_key = ""
-    try:
-        default_key = st.secrets.get("GEMINI_API_KEY", "")
-    except Exception:
-        pass
-
+    st.markdown('<div class="sidebar-label">🔑 API Configuration</div>', unsafe_allow_html=True)
     gemini_key = st.text_input(
         "Gemini API Key",
         type="password",
-        value=default_key,
-        placeholder="AIza...",
-        help="Get yours free at aistudio.google.com",
-        label_visibility="collapsed",
+        placeholder="AIzaSy...",
+        help="Get your free key at aistudio.google.com",
+        value=st.session_state.gemini_key,
     )
     if gemini_key:
         st.session_state.gemini_key = gemini_key
 
-    st.markdown(
-        '<div style="font-family:\'IBM Plex Mono\',monospace;font-size:0.68rem;'
-        'color:#484f58;margin-top:4px;">Free at '
-        '<a href="https://aistudio.google.com" target="_blank" style="color:#58a6ff;">aistudio.google.com</a>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    # ── Video Input ──
-    st.markdown('<div class="sidebar-label">🎬 Video</div>', unsafe_allow_html=True)
+    st.divider()
+    st.markdown('<div class="sidebar-label">🎬 Video Input</div>', unsafe_allow_html=True)
 
     youtube_url = st.text_input(
         "YouTube URL",
-        placeholder="https://youtube.com/watch?v=...",
-        label_visibility="collapsed",
+        placeholder="https://www.youtube.com/watch?v=...",
     )
 
-    # ── Model ──
-    st.markdown('<div class="sidebar-label">⚙️ Model</div>', unsafe_allow_html=True)
-    model_choice = st.selectbox(
-        "Gemini model",
-        ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
+    st.markdown('<div class="sidebar-label">⚙️ Summary Options</div>', unsafe_allow_html=True)
+
+    summary_style = st.selectbox(
+        "Summary Style",
+        ["Detailed", "Brief", "Bullet Points", "Chapter-by-Chapter"],
         index=0,
+    )
+
+    output_language = st.selectbox(
+        "Output Language",
+        [
+            "English", "Hindi", "Bengali", "Spanish", "French",
+            "German", "Portuguese", "Arabic", "Japanese", "Chinese",
+            "Korean", "Italian", "Russian", "Turkish", "Dutch",
+        ],
+        index=0,
+        help="Summary and answers will be generated in this language",
+    )
+
+    st.divider()
+    st.markdown('<div class="sidebar-label">🍪 YouTube Cookies (Optional)</div>', unsafe_allow_html=True)
+    st.caption("Required if videos fail to load on cloud. [How to get cookies?](https://github.com/jdepoix/youtube-transcript-api#cookies)")
+    cookies_file = st.file_uploader(
+        "Upload cookies.txt",
+        type=["txt"],
+        help="Export from browser using 'Get cookies.txt LOCALLY' extension on youtube.com",
         label_visibility="collapsed",
-        help="gemini-2.0-flash = fastest & free. gemini-1.5-pro = best quality.",
     )
+    # Save cookies to disk if uploaded
+    cookies_path = None
+    if cookies_file is not None:
+        cookies_path = "cookies.txt"
+        with open(cookies_path, "wb") as f:
+            f.write(cookies_file.read())
+        st.success("✅ Cookies loaded!")
 
-    model_info = {
-        "gemini-2.0-flash": ("⚡ Fastest · Free tier · Recommended", "#39d0d8"),
-        "gemini-1.5-flash": ("🚀 Fast · Great quality · Free tier", "#f0a500"),
-        "gemini-1.5-pro": ("🧠 Best quality · 1M context · Limited free", "#58a6ff"),
-    }
-    info_text, info_color = model_info[model_choice]
-    st.markdown(
-        f'<div style="font-family:\'IBM Plex Mono\',monospace;font-size:0.68rem;'
-        f'color:{info_color};margin-top:4px;">{info_text}</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("<div style='margin-top:1rem'></div>", unsafe_allow_html=True)
-    load_btn = st.button("⬤ Load Video", type="primary", use_container_width=True)
+    load_btn = st.button("🚀 Load & Summarize", type="primary", use_container_width=True)
 
     if st.session_state.video_loaded:
-        st.markdown("<div style='margin-top:0.5rem'></div>", unsafe_allow_html=True)
-        if st.button("↺ New Video", type="secondary", use_container_width=True):
+        st.divider()
+        if st.button("🔄 Load New Video", use_container_width=True):
             for k, v in defaults.items():
                 st.session_state[k] = v
             st.rerun()
 
-    # ── How it works ──
-    st.markdown('<div class="sidebar-label" style="margin-top:1.5rem">ℹ️ How It Works</div>', unsafe_allow_html=True)
-    steps = [
-        "Fetch transcript + timestamps",
-        "Chunk text with overlap",
-        "Embed via Google models/embedding-001",
-        "Store in FAISS vector index",
-        "Your question → top-k retrieval",
-        "Gemini answers from context only",
-    ]
-    for i, step in enumerate(steps, 1):
-        st.markdown(
-            f'<div class="how-step"><div class="step-num">{i}</div>{step}</div>',
-            unsafe_allow_html=True,
-        )
+        # Stats
+        chunks = st.session_state.transcript_chunks
+        if chunks:
+            st.divider()
+            st.markdown('<div class="sidebar-label">📊 Video Stats</div>', unsafe_allow_html=True)
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown(f"""
+                <div class="stat-card">
+                    <div class="stat-value">{len(chunks)}</div>
+                    <div class="stat-label">Chunks</div>
+                </div>""", unsafe_allow_html=True)
+            with col2:
+                total_words = sum(len(c.page_content.split()) for c in chunks)
+                st.markdown(f"""
+                <div class="stat-card">
+                    <div class="stat-value">{total_words // 1000}K</div>
+                    <div class="stat-label">Words</div>
+                </div>""", unsafe_allow_html=True)
 
-# ── Load Video Logic ──────────────────────────────────────────────────────────
+            # Duration estimate
+            last_ts = chunks[-1].metadata.get("start", 0)
+            st.markdown(f"""
+            <div class="stat-card" style="margin-top:10px">
+                <div class="stat-value">{format_timestamp(last_ts)}</div>
+                <div class="stat-label">~Duration</div>
+            </div>""", unsafe_allow_html=True)
+
+    st.divider()
+    st.markdown('<div class="sidebar-label">ℹ️ How it works</div>', unsafe_allow_html=True)
+    st.caption("1. Fetches transcript from YouTube")
+    st.caption("2. Chunks text with timestamps")
+    st.caption("3. Embeds with Google AI")
+    st.caption("4. Summarizes with Gemini 2.0 Flash")
+    st.caption("5. Answers questions via RAG")
+
+# ── Load Video ─────────────────────────────────────────────────────────────────
 if load_btn:
     if not st.session_state.gemini_key:
-        st.error("⚠️ Please enter your Gemini API key in the sidebar.")
+        st.error("⚠️ Please enter your Gemini API Key in the sidebar.")
     elif not youtube_url:
         st.error("⚠️ Please paste a YouTube URL.")
     else:
         video_id = extract_video_id(youtube_url)
         if not video_id:
-            st.error("❌ Could not parse video ID. Please check the URL.")
+            st.error("❌ Could not parse a video ID. Make sure it's a valid YouTube link.")
         else:
-            with st.spinner("Fetching transcript & building vector index…"):
+            with st.spinner("Fetching transcript, building index & generating summary…"):
                 try:
-                    chunks = fetch_transcript(video_id)
+                    chunks = fetch_transcript(video_id, cookie_file=cookies_path)
                     if not chunks:
-                        st.error("No transcript found. The video may not have captions enabled.")
+                        st.error("No transcript found. Captions may be disabled.")
                     else:
                         vs = build_vector_store(chunks, st.session_state.gemini_key)
+                        summary = summarize_video(
+                            chunks,
+                            st.session_state.gemini_key,
+                            output_language=output_language,
+                            summary_style=summary_style,
+                        )
+                        langs = get_available_languages(video_id)
+
                         st.session_state.vector_store = vs
                         st.session_state.video_id = video_id
                         st.session_state.transcript_chunks = chunks
                         st.session_state.video_loaded = True
                         st.session_state.messages = []
-                        st.session_state.model_choice = model_choice
-                        st.session_state.chunk_count = len(chunks)
-                        st.session_state.video_duration = estimate_duration(chunks)
+                        st.session_state.summary = summary
+                        st.session_state.available_langs = langs
                         st.rerun()
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
 
-# ── Main Content ──────────────────────────────────────────────────────────────
+# ── Main Content ───────────────────────────────────────────────────────────────
+if not st.session_state.video_loaded:
+    st.info("👈 Enter your Gemini API key and a YouTube URL in the sidebar, then click **Load & Summarize**.")
 
-# ─ Video Loaded State ─
-if st.session_state.video_loaded and st.session_state.video_id:
-    vid = st.session_state.video_id
-    thumb_url = f"https://img.youtube.com/vi/{vid}/mqdefault.jpg"
-    watch_url = f"https://www.youtube.com/watch?v={vid}"
-
-    st.markdown(f"""
-    <div class="video-card">
-        <img class="video-thumb" src="{thumb_url}" alt="thumbnail" />
-        <div class="video-info">
-            <div class="video-url">
-                <a href="{watch_url}" target="_blank" style="color:#58a6ff;text-decoration:none;">
-                    youtube.com/watch?v={vid}
-                </a>
-            </div>
-            <div class="video-stats">
-                <span class="stat-pill">📦 {st.session_state.chunk_count} chunks</span>
-                <span class="stat-pill">⏱ ~{st.session_state.video_duration}</span>
-                <span class="gem-badge">✦ {st.session_state.model_choice}</span>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── Render chat history ──
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-            if msg.get("sources"):
-                st.markdown('<div class="ts-section-label">▸ Jump to in video</div>', unsafe_allow_html=True)
-                badges_html = ""
-                for src in msg["sources"][:6]:
-                    ts = format_timestamp(src)
-                    url = f"https://www.youtube.com/watch?v={st.session_state.video_id}&t={src}s"
-                    badges_html += f'<a class="ts-badge" href="{url}" target="_blank">▶ {ts}</a>'
-                st.markdown(f'<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:2px">{badges_html}</div>', unsafe_allow_html=True)
-
-    # ── Chat input ──
-    if prompt := st.chat_input("Ask anything about this video…"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking…"):
-                try:
-                    answer, sources = get_answer(
-                        question=prompt,
-                        vector_store=st.session_state.vector_store,
-                        gemini_key=st.session_state.gemini_key,
-                        model=st.session_state.model_choice,
-                        chat_history=st.session_state.messages[:-1],
-                    )
-                    st.markdown(answer)
-
-                    if sources:
-                        st.markdown('<div class="ts-section-label">▸ Jump to in video</div>', unsafe_allow_html=True)
-                        badges_html = ""
-                        for src in sources[:6]:
-                            ts = format_timestamp(src)
-                            url = f"https://www.youtube.com/watch?v={st.session_state.video_id}&t={src}s"
-                            badges_html += f'<a class="ts-badge" href="{url}" target="_blank">▶ {ts}</a>'
-                        st.markdown(f'<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:2px">{badges_html}</div>', unsafe_allow_html=True)
-
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": answer,
-                        "sources": sources,
-                    })
-                except Exception as e:
-                    err = f"⚠️ Error: {e}"
-                    st.error(err)
-                    st.session_state.messages.append({"role": "assistant", "content": err, "sources": []})
-
-# ─ Empty / Welcome State ─
-else:
-    st.markdown("""
-    <div class="empty-state">
-        <div class="empty-icon">🎬</div>
-        <div class="empty-title">Ready to chat with any YouTube video</div>
-        <div class="empty-desc">
-            Enter your Gemini API key and a YouTube URL<br>
-            in the sidebar, then click <strong style="color:#e6edf3">Load Video</strong>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
+    # Feature cards
     col1, col2, col3 = st.columns(3)
-    cards = [
-        ("🔑", "Free API Key", "Get Gemini API key from Google AI Studio — no credit card needed"),
-        ("⚡", "Any Video", "Works with any YouTube video that has captions or auto-subtitles"),
-        ("🌐", "Cloud Ready", "Deploy to Streamlit Cloud — store key in Secrets, zero config"),
-    ]
-    for col, (icon, title, desc) in zip([col1, col2, col3], cards):
-        with col:
-            st.markdown(f"""
-            <div style="
-                background:var(--bg-elevated);
-                border:1px solid var(--border);
-                border-radius:var(--radius-md);
-                padding:18px 16px;
-                text-align:center;
-            ">
-                <div style="font-size:1.8rem;margin-bottom:10px">{icon}</div>
-                <div style="font-family:'Manrope',sans-serif;font-weight:700;
-                            font-size:0.9rem;color:var(--text-primary);margin-bottom:6px">{title}</div>
-                <div style="font-family:'IBM Plex Mono',monospace;font-size:0.72rem;
-                            color:var(--text-muted);line-height:1.6">{desc}</div>
-            </div>
-            """, unsafe_allow_html=True)
+    with col1:
+        st.markdown("""
+        <div class="stat-card" style="padding:20px;text-align:left">
+            <div style="font-size:24px;margin-bottom:8px">📝</div>
+            <div style="font-weight:600;margin-bottom:4px;color:#fff">Smart Summarization</div>
+            <div style="font-size:12px;color:#555">Timestamped summaries in 4 styles — brief, detailed, bullets, or chapters</div>
+        </div>""", unsafe_allow_html=True)
+    with col2:
+        st.markdown("""
+        <div class="stat-card" style="padding:20px;text-align:left">
+            <div style="font-size:24px;margin-bottom:8px">💬</div>
+            <div style="font-weight:600;margin-bottom:4px;color:#fff">Chat with Video</div>
+            <div style="font-size:12px;color:#555">Ask anything about the video — get answers with clickable timestamp links</div>
+        </div>""", unsafe_allow_html=True)
+    with col3:
+        st.markdown("""
+        <div class="stat-card" style="padding:20px;text-align:left">
+            <div style="font-size:24px;margin-bottom:8px">🌍</div>
+            <div style="font-weight:600;margin-bottom:4px;color:#fff">Any Language</div>
+            <div style="font-size:12px;color:#555">Get summaries and answers in 15+ languages including Hindi & Bengali</div>
+        </div>""", unsafe_allow_html=True)
+
+else:
+    vid = st.session_state.video_id
+
+    # Video meta bar
+    st.markdown(f"""
+    <div class="video-meta">
+        <span style="font-size:20px">▶️</span>
+        <a href="https://www.youtube.com/watch?v={vid}" target="_blank">
+            youtube.com/watch?v={vid}
+        </a>
+        <span class="chunk-count">{len(st.session_state.transcript_chunks)} chunks · {output_language}</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Tabs ───────────────────────────────────────────────────────────────────
+    tab1, tab2 = st.tabs(["📝 Summary", "💬 Chat with Video"])
+
+    # ── Tab 1: Summary ─────────────────────────────────────────────────────────
+    with tab1:
+        if st.session_state.summary:
+            # Action buttons row
+            col1, col2, col3 = st.columns([1, 1, 4])
+            with col1:
+                if st.button("🔄 Regenerate", use_container_width=True):
+                    with st.spinner("Regenerating summary…"):
+                        try:
+                            new_summary = summarize_video(
+                                st.session_state.transcript_chunks,
+                                st.session_state.gemini_key,
+                                output_language=output_language,
+                                summary_style=summary_style,
+                            )
+                            st.session_state.summary = new_summary
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+            with col2:
+                st.download_button(
+                    "💾 Export",
+                    data=st.session_state.summary,
+                    file_name=f"summary_{vid}.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+
+            st.markdown("---")
+            st.markdown(st.session_state.summary)
+
+        else:
+            st.info("Summary will appear here after loading a video.")
+
+    # ── Tab 2: Q&A Chat ────────────────────────────────────────────────────────
+    with tab2:
+        # Available languages info
+        if st.session_state.available_langs:
+            lang_names = [f"{l['name']} {'(auto)' if l['auto'] else ''}" for l in st.session_state.available_langs[:5]]
+            st.caption(f"📡 Transcript languages available: {', '.join(lang_names)}")
+
+        st.caption("💡 Ask anything about the video. Answers include clickable timestamp links.")
+
+        # Render existing messages
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+                if msg.get("sources"):
+                    st.markdown("**Jump to:**")
+                    badges = ""
+                    for src in msg["sources"][:5]:
+                        ts = format_timestamp(src)
+                        url = f"https://www.youtube.com/watch?v={vid}&t={src}s"
+                        badges += f'<a href="{url}" target="_blank" class="ts-badge">▶ {ts}</a>'
+                    st.markdown(badges, unsafe_allow_html=True)
+
+        # Chat input
+        if prompt := st.chat_input("Ask anything about this video…"):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking…"):
+                    try:
+                        answer, sources = get_answer(
+                            question=prompt,
+                            vector_store=st.session_state.vector_store,
+                            gemini_key=st.session_state.gemini_key,
+                            chat_history=st.session_state.messages[:-1],
+                        )
+                        st.markdown(answer)
+
+                        if sources:
+                            st.markdown("**Jump to:**")
+                            badges = ""
+                            for src in sources[:5]:
+                                ts = format_timestamp(src)
+                                url = f"https://www.youtube.com/watch?v={vid}&t={src}s"
+                                badges += f'<a href="{url}" target="_blank" class="ts-badge">▶ {ts}</a>'
+                            st.markdown(badges, unsafe_allow_html=True)
+
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": answer,
+                            "sources": sources,
+                        })
+
+                    except Exception as e:
+                        err = f"❌ Error: {e}"
+                        st.error(err)
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": err,
+                            "sources": [],
+                        })
+
+        # Export chat
+        if st.session_state.messages:
+            st.divider()
+            chat_export = "\n\n".join(
+                f"{'USER' if m['role'] == 'user' else 'ASSISTANT'}: {m['content']}"
+                for m in st.session_state.messages
+            )
+            st.download_button(
+                "💾 Export Chat",
+                data=chat_export,
+                file_name=f"chat_{vid}.txt",
+                mime="text/plain",
+            )
