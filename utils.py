@@ -1,11 +1,10 @@
 """
 utils.py — helper functions for YT Summarizer
-Compatible with Python 3.11+
+Compatible with Python 3.11+  |  youtube-transcript-api v1.x
 """
 
 from __future__ import annotations
 
-import io
 import json
 import re
 import textwrap
@@ -23,6 +22,23 @@ from youtube_transcript_api._errors import (
 )
 
 
+# ── Browser-like headers (used when building sessions) ────────────────────────
+
+_YT_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/webp,*/*;q=0.8"
+    ),
+    "Referer": "https://www.youtube.com/",
+}
+
+
 # ── Video ID extraction ───────────────────────────────────────────────────────
 
 def extract_video_id(url: str) -> str | None:
@@ -34,7 +50,7 @@ def extract_video_id(url: str) -> str | None:
     url = url.strip()
     parsed = urlparse(url)
 
-    # youtu.be/VIDEO_ID  (may have ?si= tracking suffix — ignore it)
+    # youtu.be/VIDEO_ID
     if parsed.netloc in ("youtu.be", "www.youtu.be"):
         vid = parsed.path.lstrip("/").split("/")[0]
         return vid if _valid_id(vid) else None
@@ -42,7 +58,7 @@ def extract_video_id(url: str) -> str | None:
     if "youtube.com" in parsed.netloc:
         qs = parse_qs(parsed.query)
         if "v" in qs:
-            vid = qs["v"][0]          # parse_qs already strips &si= etc.
+            vid = qs["v"][0]
             return vid if _valid_id(vid) else None
         match = re.search(r"(?:embed|shorts|v)/([A-Za-z0-9_-]{11})", parsed.path)
         if match:
@@ -88,24 +104,17 @@ def fetch_video_metadata(video_id: str) -> dict[str, Any] | None:
 
 
 def _scrape_metadata(video_id: str) -> dict[str, Any] | None:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
     try:
         resp = requests.get(
             f"https://www.youtube.com/watch?v={video_id}",
-            headers=headers, timeout=12,
+            headers=_YT_HEADERS,
+            timeout=12,
         )
         if resp.status_code != 200:
             return None
         html = resp.text
 
-        # ── Title: og:title is most reliable ─────────────────────────────────
+        # ── Title ─────────────────────────────────────────────────────────────
         title = "Unknown"
         og_title = re.search(r'<meta property="og:title"\s+content="([^"]+)"', html)
         if og_title:
@@ -115,23 +124,21 @@ def _scrape_metadata(video_id: str) -> dict[str, Any] | None:
             if t2:
                 title = t2.group(1)
 
-        # ── Author: ownerChannelName is the canonical field ───────────────────
+        # ── Author ────────────────────────────────────────────────────────────
         author = "Unknown"
         a1 = re.search(r'"ownerChannelName"\s*:\s*"([^"]+)"', html)
         if a1:
             author = a1.group(1)
         else:
-            # fallback: channelName inside microformat
             a2 = re.search(r'"channelName"\s*:\s*"([^"]+)"', html)
             if a2:
                 author = a2.group(1)
             else:
-                # last resort: author meta tag
                 a3 = re.search(r'"author"\s*:\s*"([^"]+)"', html)
                 if a3:
                     author = a3.group(1)
 
-        # ── Duration: lengthSeconds is most reliable ──────────────────────────
+        # ── Duration ──────────────────────────────────────────────────────────
         duration = "N/A"
         d1 = re.search(r'"lengthSeconds"\s*:\s*"(\d+)"', html)
         if d1:
@@ -150,7 +157,6 @@ def _scrape_metadata(video_id: str) -> dict[str, Any] | None:
         if v1:
             views = _fmt_views(int(v1.group(1)))
         else:
-            # microformat style: videoViewCountRenderer
             v2 = re.search(r'"videoViewCountRenderer".*?"simpleText"\s*:\s*"([^"]+)"', html)
             if v2:
                 views = v2.group(1)
@@ -161,16 +167,15 @@ def _scrape_metadata(video_id: str) -> dict[str, Any] | None:
         if th:
             thumbnail = th.group(1)
 
-        # Only return if we got at least title or author
         if title == "Unknown" and author == "Unknown":
             return None
 
         return {
-            "title": title,
-            "author": author,
+            "title":     title,
+            "author":    author,
             "thumbnail": thumbnail,
-            "duration": duration,
-            "views": views,
+            "duration":  duration,
+            "views":     views,
         }
     except Exception:
         return None
@@ -188,7 +193,10 @@ def _oembed_metadata(video_id: str) -> dict[str, Any] | None:
             return {
                 "title":     data.get("title", "Unknown"),
                 "author":    data.get("author_name", "Unknown"),
-                "thumbnail": data.get("thumbnail_url", f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"),
+                "thumbnail": data.get(
+                    "thumbnail_url",
+                    f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                ),
                 "duration":  "N/A",
                 "views":     "N/A",
             }
@@ -197,15 +205,15 @@ def _oembed_metadata(video_id: str) -> dict[str, Any] | None:
     return None
 
 
-# ── Transcript fetching ───────────────────────────────────────────────────────
+# ── Cookie / session helpers ──────────────────────────────────────────────────
 
 def _parse_netscape_cookies(cookies_txt: str) -> list[dict]:
     """
     Parse a Netscape-format cookies.txt into a list of cookie dicts.
-    Lines look like:
+    Each line (tab-separated):
       .youtube.com  TRUE  /  FALSE  0  COOKIE_NAME  cookie_value
     """
-    cookies = []
+    cookies: list[dict] = []
     for line in cookies_txt.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -214,36 +222,47 @@ def _parse_netscape_cookies(cookies_txt: str) -> list[dict]:
         if len(parts) < 7:
             continue
         domain, _, path, secure, _, name, value = parts[:7]
-        cookies.append({
-            "domain": domain,
-            "path": path,
-            "secure": secure.upper() == "TRUE",
-            "name": name,
-            "value": value,
-        })
+        cookies.append(
+            {
+                "domain": domain,
+                "path":   path,
+                "secure": secure.upper() == "TRUE",
+                "name":   name,
+                "value":  value,
+            }
+        )
     return cookies
 
 
 def _session_from_cookies(cookies_txt: str | None) -> requests.Session:
     """
-    Build a requests.Session with browser-like headers.
-    If cookies_txt (Netscape format) is provided, load them so
-    YouTube accepts requests from cloud server IPs.
+    Build a requests.Session with browser-like headers + optional YT cookies.
+    Providing cookies_txt (Netscape format) greatly improves success on
+    cloud server IPs that YouTube otherwise blocks.
     """
     session = requests.Session()
     session.headers.update(_YT_HEADERS)
-    # Always set basic consent cookies
+
+    # Basic consent cookies — always set
     session.cookies.set("CONSENT", "YES+cb", domain=".youtube.com")
-    session.cookies.set("SOCS", "CAESEwgDEgk0OTc5NTkzNzIaAmVuIAEaBgiAo_CmBg", domain=".youtube.com")
+    session.cookies.set(
+        "SOCS",
+        "CAESEwgDEgk0OTc5NTkzNzIaAmVuIAEaBgiAo_CmBg",
+        domain=".youtube.com",
+    )
 
     if cookies_txt:
         for ck in _parse_netscape_cookies(cookies_txt):
             session.cookies.set(
-                ck["name"], ck["value"],
-                domain=ck["domain"], path=ck["path"],
+                ck["name"],
+                ck["value"],
+                domain=ck["domain"],
+                path=ck["path"],
             )
     return session
 
+
+# ── Transcript fetching ───────────────────────────────────────────────────────
 
 def fetch_transcript(
     video_id: str,
@@ -252,9 +271,10 @@ def fetch_transcript(
 ) -> tuple[str, str | None]:
     """
     Fetch transcript using youtube-transcript-api v1.x.
-    Pass cookies_txt (Netscape format) to bypass YouTube IP blocks on cloud servers.
-    Returns (text, error). error is None on success.
+    Pass cookies_txt (Netscape format) to bypass YouTube IP blocks on cloud.
+    Returns (text, error_message). error_message is None on success.
     """
+
     def _best_transcript(tlist):
         try:
             return tlist.find_manually_created_transcript(["en"])
@@ -264,13 +284,18 @@ def fetch_transcript(
             return tlist.find_generated_transcript(["en"])
         except NoTranscriptFound:
             pass
+        # Fall back to the first available transcript in any language
         return next(iter(tlist))
 
     def _run(session: requests.Session | None) -> tuple[str, str | None]:
         try:
-            ytt = YouTubeTranscriptApi(http_client=session) if session else YouTubeTranscriptApi()
-            tlist = ytt.list(video_id)
-            segs = _best_transcript(tlist).fetch()
+            ytt = (
+                YouTubeTranscriptApi(http_client=session)
+                if session is not None
+                else YouTubeTranscriptApi()
+            )
+            tlist  = ytt.list(video_id)
+            segs   = _best_transcript(tlist).fetch()
             return _segs_to_text(segs, include_timestamps), None
         except TranscriptsDisabled:
             return "", "Transcripts are disabled for this video."
@@ -280,21 +305,21 @@ def fetch_transcript(
             return "", "No transcript found — video may not have captions."
         except (RequestBlocked, CouldNotRetrieveTranscript):
             return "", "__blocked__"
-        except Exception as e:
-            return "", f"Unexpected error: {e}"
+        except Exception as exc:
+            return "", f"Unexpected error: {exc}"
 
-    # Attempt 1 — with cookies + browser headers (best chance on cloud)
+    # Attempt 1 — with browser-spoofed session (+ user cookies if provided)
     session = _session_from_cookies(cookies_txt)
     text, err = _run(session)
     if text or (err and err != "__blocked__"):
         return text, err
 
-    # Attempt 2 — plain session (different code path)
+    # Attempt 2 — bare session (different internal code path)
     text, err = _run(None)
     if text or (err and err != "__blocked__"):
         return text, err
 
-    # Both attempts blocked
+    # Both attempts were blocked
     if cookies_txt:
         return "", (
             "YouTube is still blocking requests even with the provided cookies. "
@@ -302,13 +327,13 @@ def fetch_transcript(
             "then re-upload the file."
         )
     return "", (
-        "YouTube is blocking transcript requests from this server's IP. "
+        "YouTube is blocking transcript requests from this server's IP address. "
         "**Fix:** upload your `cookies.txt` in the sidebar "
         "(export it with the *Get cookies.txt* Chrome extension while logged into YouTube)."
     )
 
 
-def _segs_to_text(segments: list[Any], include_timestamps: bool) -> str:
+def _segs_to_text(segments: Any, include_timestamps: bool) -> str:
     if include_timestamps:
         return "\n".join(f"[{_fmt_ts(seg.start)}] {seg.text}" for seg in segments)
     return " ".join(seg.text for seg in segments)
@@ -316,19 +341,19 @@ def _segs_to_text(segments: list[Any], include_timestamps: bool) -> str:
 
 def _fmt_ts(seconds: float) -> str:
     seconds = int(seconds)
-    h, r = divmod(seconds, 3600)
-    m, s = divmod(r, 60)
+    h, r    = divmod(seconds, 3600)
+    m, s    = divmod(r, 60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
-# ── Gemini ────────────────────────────────────────────────────────────────────
+# ── Gemini helpers ────────────────────────────────────────────────────────────
 
 _GEMINI_ENDPOINT = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-2.0-flash:generateContent"
 )
 
-_STYLE_INSTRUCTIONS = {
+_STYLE_INSTRUCTIONS: dict[str, str] = {
     "Concise":         "Provide a concise summary in 3-5 short paragraphs.",
     "Detailed":        "Provide a thorough, detailed summary covering all major topics discussed.",
     "Bullet Points":   "Summarize using clearly organized bullet points grouped by topic.",
@@ -345,7 +370,11 @@ def _call_gemini(prompt: str, api_key: str, max_tokens: int = 1024) -> str:
         headers={"Content-Type": "application/json"},
         json={
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.4, "topP": 0.9},
+            "generationConfig": {
+                "maxOutputTokens": max_tokens,
+                "temperature":     0.4,
+                "topP":            0.9,
+            },
         },
         timeout=60,
     )
@@ -353,15 +382,18 @@ def _call_gemini(prompt: str, api_key: str, max_tokens: int = 1024) -> str:
     data = resp.json()
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except (KeyError, IndexError) as e:
-        raise ValueError(f"Unexpected Gemini response: {data}") from e
+    except (KeyError, IndexError) as exc:
+        raise ValueError(f"Unexpected Gemini response structure: {data}") from exc
 
 
 def summarize_with_gemini(
-    transcript: str, api_key: str, style: str = "Concise",
-    language: str = "English", max_tokens: int = 1024,
+    transcript: str,
+    api_key: str,
+    style: str = "Concise",
+    language: str = "English",
+    max_tokens: int = 1024,
 ) -> str:
-    instr = _STYLE_INSTRUCTIONS.get(style, _STYLE_INSTRUCTIONS["Concise"])
+    instr  = _STYLE_INSTRUCTIONS.get(style, _STYLE_INSTRUCTIONS["Concise"])
     prompt = textwrap.dedent(f"""
         You are an expert content analyst summarizing a YouTube video transcript.
         Style: {instr}
@@ -375,11 +407,13 @@ def summarize_with_gemini(
     return _call_gemini(prompt, api_key, max_tokens)
 
 
-def generate_key_points(transcript: str, api_key: str, max_tokens: int = 1024) -> list[str] | str:
+def generate_key_points(
+    transcript: str, api_key: str, max_tokens: int = 1024
+) -> list[str] | str:
     prompt = textwrap.dedent(f"""
         Extract the 7 most important key points from this YouTube transcript.
         Respond ONLY with a valid JSON array of strings.
-        Do not include any other text.
+        Do not include any other text or markdown fences.
 
         Transcript:
         {transcript[:30_000]}
@@ -387,7 +421,7 @@ def generate_key_points(transcript: str, api_key: str, max_tokens: int = 1024) -
     raw = _call_gemini(prompt, api_key, max_tokens)
     try:
         clean = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
-        pts = json.loads(clean)
+        pts   = json.loads(clean)
         if isinstance(pts, list):
             return [str(p) for p in pts]
     except (json.JSONDecodeError, ValueError):
@@ -395,12 +429,13 @@ def generate_key_points(transcript: str, api_key: str, max_tokens: int = 1024) -
     return raw
 
 
-def generate_quiz(transcript: str, api_key: str, n_questions: int = 5) -> list[dict] | str:
+def generate_quiz(
+    transcript: str, api_key: str, n_questions: int = 5
+) -> list[dict] | str:
     prompt = textwrap.dedent(f"""
         Create {n_questions} comprehension questions from this YouTube transcript.
-        Respond ONLY with a valid JSON array:
+        Respond ONLY with a valid JSON array (no markdown fences):
         [{{"question":"...","answer":"...","explanation":"..."}}]
-        No other text or markdown.
 
         Transcript:
         {transcript[:25_000]}
@@ -418,9 +453,22 @@ def generate_quiz(transcript: str, api_key: str, n_questions: int = 5) -> list[d
 
 # ── Export ────────────────────────────────────────────────────────────────────
 
-def export_summary_as_txt(title: str, summary: str, key_points: list[str] | str) -> str:
-    sep = "=" * 60
-    lines = [sep, f"YouTube Video Summary: {title}", sep, "", "SUMMARY", "-------", summary, "", "KEY POINTS", "----------"]
+def export_summary_as_txt(
+    title: str, summary: str, key_points: list[str] | str
+) -> str:
+    sep   = "=" * 60
+    lines = [
+        sep,
+        f"YouTube Video Summary: {title}",
+        sep,
+        "",
+        "SUMMARY",
+        "-------",
+        summary,
+        "",
+        "KEY POINTS",
+        "----------",
+    ]
     if isinstance(key_points, list):
         for i, pt in enumerate(key_points, 1):
             lines.append(f"{i}. {pt}")
