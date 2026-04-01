@@ -6,10 +6,7 @@ Compatible with Python 3.11+
 from __future__ import annotations
 
 import json
-import os
 import re
-import subprocess
-import tempfile
 import textwrap
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -28,9 +25,15 @@ from youtube_transcript_api._errors import (
 # ── Video ID extraction ───────────────────────────────────────────────────────
 
 def extract_video_id(url: str) -> str | None:
+    """
+    Handles all YouTube URL formats including ?si= tracking params:
+      youtu.be/ID?si=xxx  |  youtube.com/watch?v=ID&si=xxx
+      youtube.com/shorts/ID  |  youtube.com/embed/ID
+    """
     url = url.strip()
     parsed = urlparse(url)
 
+    # youtu.be/VIDEO_ID  (may have ?si= tracking suffix — ignore it)
     if parsed.netloc in ("youtu.be", "www.youtu.be"):
         vid = parsed.path.lstrip("/").split("/")[0]
         return vid if _valid_id(vid) else None
@@ -38,12 +41,13 @@ def extract_video_id(url: str) -> str | None:
     if "youtube.com" in parsed.netloc:
         qs = parse_qs(parsed.query)
         if "v" in qs:
-            vid = qs["v"][0]
+            vid = qs["v"][0]          # parse_qs already strips &si= etc.
             return vid if _valid_id(vid) else None
         match = re.search(r"(?:embed|shorts|v)/([A-Za-z0-9_-]{11})", parsed.path)
         if match:
             return match.group(1)
 
+    # bare 11-char ID
     match = re.fullmatch(r"[A-Za-z0-9_-]{11}", url)
     if match:
         return url
@@ -100,31 +104,37 @@ def _scrape_metadata(video_id: str) -> dict[str, Any] | None:
             return None
         html = resp.text
 
-        # Title — from og:title meta tag (most reliable)
+        # ── Title: og:title is most reliable ─────────────────────────────────
         title = "Unknown"
-        og = re.search(r'<meta property="og:title" content="([^"]+)"', html)
-        if og:
-            title = og.group(1)
+        og_title = re.search(r'<meta property="og:title"\s+content="([^"]+)"', html)
+        if og_title:
+            title = og_title.group(1)
         else:
-            t = re.search(r'"title"\s*:\s*\{"runs":\[.*?"text"\s*:\s*"([^"]+)"', html)
-            if t:
-                title = t.group(1)
+            t2 = re.search(r'"title"\s*:\s*\{"runs":\[{"text":"([^"]+)"', html)
+            if t2:
+                title = t2.group(1)
 
-        # Author
+        # ── Author: ownerChannelName is the canonical field ───────────────────
         author = "Unknown"
-        a = re.search(r'"ownerChannelName"\s*:\s*"([^"]+)"', html)
-        if a:
-            author = a.group(1)
+        a1 = re.search(r'"ownerChannelName"\s*:\s*"([^"]+)"', html)
+        if a1:
+            author = a1.group(1)
         else:
-            a2 = re.search(r'"author"\s*:\s*"([^"]+)"', html)
+            # fallback: channelName inside microformat
+            a2 = re.search(r'"channelName"\s*:\s*"([^"]+)"', html)
             if a2:
                 author = a2.group(1)
+            else:
+                # last resort: author meta tag
+                a3 = re.search(r'"author"\s*:\s*"([^"]+)"', html)
+                if a3:
+                    author = a3.group(1)
 
-        # Duration (ISO 8601)
+        # ── Duration: lengthSeconds is most reliable ──────────────────────────
         duration = "N/A"
-        d = re.search(r'"lengthSeconds"\s*:\s*"(\d+)"', html)
-        if d:
-            secs = int(d.group(1))
+        d1 = re.search(r'"lengthSeconds"\s*:\s*"(\d+)"', html)
+        if d1:
+            secs = int(d1.group(1))
             h, r = divmod(secs, 3600)
             mn, s = divmod(r, 60)
             duration = f"{h}:{mn:02d}:{s:02d}" if h else f"{mn}:{s:02d}"
@@ -133,17 +143,26 @@ def _scrape_metadata(video_id: str) -> dict[str, Any] | None:
             if d2:
                 duration = _parse_iso_duration(d2.group(1))
 
-        # Views
+        # ── Views ─────────────────────────────────────────────────────────────
         views = "N/A"
-        v = re.search(r'"viewCount"\s*:\s*"(\d+)"', html)
-        if v:
-            views = _fmt_views(int(v.group(1)))
+        v1 = re.search(r'"viewCount"\s*:\s*"(\d+)"', html)
+        if v1:
+            views = _fmt_views(int(v1.group(1)))
+        else:
+            # microformat style: videoViewCountRenderer
+            v2 = re.search(r'"videoViewCountRenderer".*?"simpleText"\s*:\s*"([^"]+)"', html)
+            if v2:
+                views = v2.group(1)
 
-        # Thumbnail — prefer maxresdefault, fallback to hqdefault
+        # ── Thumbnail ─────────────────────────────────────────────────────────
         thumbnail = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
-        th = re.search(r'<meta property="og:image" content="([^"]+)"', html)
+        th = re.search(r'<meta property="og:image"\s+content="([^"]+)"', html)
         if th:
             thumbnail = th.group(1)
+
+        # Only return if we got at least title or author
+        if title == "Unknown" and author == "Unknown":
+            return None
 
         return {
             "title": title,
@@ -184,112 +203,42 @@ def fetch_transcript(
     include_timestamps: bool = False,
 ) -> tuple[str, str | None]:
     """
-    Try youtube-transcript-api first; if blocked, fall back to yt-dlp.
-    Returns (text, error).  error is None on success.
+    Fetch transcript using youtube-transcript-api v1.x only.
+    Returns (text, error). error is None on success.
     """
-    text, err = _transcript_via_api(video_id, include_timestamps)
-    if text:
-        return text, None
+    def _best_transcript(tlist):
+        try:
+            return tlist.find_manually_created_transcript(["en"])
+        except NoTranscriptFound:
+            pass
+        try:
+            return tlist.find_generated_transcript(["en"])
+        except NoTranscriptFound:
+            pass
+        return next(iter(tlist))  # any language
 
-    # Fallback: yt-dlp (handles IP blocks on cloud servers)
-    text2, err2 = _transcript_via_ytdlp(video_id, include_timestamps)
-    if text2:
-        return text2, None
-
-    return "", err2 or err or "Could not retrieve transcript."
-
-
-def _transcript_via_api(
-    video_id: str, include_timestamps: bool
-) -> tuple[str, str | None]:
     try:
         ytt = YouTubeTranscriptApi()
         tlist = ytt.list(video_id)
-        try:
-            t = tlist.find_manually_created_transcript(["en"])
-        except NoTranscriptFound:
-            try:
-                t = tlist.find_generated_transcript(["en"])
-            except NoTranscriptFound:
-                t = next(iter(tlist))
-        segs = t.fetch()
+        segs = _best_transcript(tlist).fetch()
         return _segs_to_text(segs, include_timestamps), None
-    except (TranscriptsDisabled, VideoUnavailable, NoTranscriptFound) as e:
-        return "", str(e)
-    except (RequestBlocked, CouldNotRetrieveTranscript):
-        return "", "blocked"
+
+    except TranscriptsDisabled:
+        return "", "Transcripts are disabled for this video."
+    except VideoUnavailable:
+        return "", "Video is unavailable or private."
+    except NoTranscriptFound:
+        return "", "No transcript found — video may not have captions."
+    except RequestBlocked:
+        return "", (
+            "YouTube is blocking requests from this server's IP address. "
+            "Run the app locally, or add your YouTube `cookies.txt` "
+            "as a `YT_COOKIES` secret in Streamlit Cloud."
+        )
+    except CouldNotRetrieveTranscript as e:
+        return "", f"Could not retrieve transcript: {e}"
     except Exception as e:
         return "", f"Unexpected error: {e}"
-
-
-def _transcript_via_ytdlp(
-    video_id: str, include_timestamps: bool
-) -> tuple[str, str | None]:
-    """Download auto-subs via yt-dlp CLI and parse VTT."""
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            out_tmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
-            cmd = [
-                "yt-dlp", "--skip-download",
-                "--write-auto-sub", "--sub-lang", "en",
-                "--sub-format", "vtt",
-                "--output", out_tmpl,
-                "--quiet", "--no-warnings",
-                f"https://www.youtube.com/watch?v={video_id}",
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-
-            vtt_file = next(
-                (os.path.join(tmpdir, f) for f in os.listdir(tmpdir) if f.endswith(".vtt")),
-                None,
-            )
-            if not vtt_file:
-                stderr = result.stderr[:300] if result.stderr else "no subtitle file created"
-                return "", f"yt-dlp subtitles unavailable: {stderr}"
-
-            with open(vtt_file, encoding="utf-8") as f:
-                return _parse_vtt(f.read(), include_timestamps), None
-
-    except FileNotFoundError:
-        return "", "yt-dlp not found — add 'yt-dlp' to requirements.txt."
-    except subprocess.TimeoutExpired:
-        return "", "yt-dlp timed out."
-    except Exception as e:
-        return "", f"yt-dlp error: {e}"
-
-
-def _parse_vtt(vtt: str, include_timestamps: bool) -> str:
-    """Parse WebVTT into clean text, deduplicating repeated lines."""
-    segments: list[tuple[str, str]] = []
-    current_ts = ""
-    current_lines: list[str] = []
-
-    for line in vtt.splitlines():
-        line = line.strip()
-        if "-->" in line:
-            if current_lines:
-                segments.append((current_ts, " ".join(current_lines)))
-                current_lines = []
-            current_ts = line.split("-->")[0].strip()
-        elif line and not line.startswith("WEBVTT") and not line.isdigit() and "align:" not in line:
-            clean = re.sub(r"<[^>]+>", "", line).strip()
-            if clean:
-                current_lines.append(clean)
-
-    if current_lines:
-        segments.append((current_ts, " ".join(current_lines)))
-
-    # Deduplicate consecutive identical segments (common in auto-subs)
-    deduped: list[tuple[str, str]] = []
-    prev = ""
-    for ts, text in segments:
-        if text != prev:
-            deduped.append((ts, text))
-            prev = text
-
-    if include_timestamps:
-        return "\n".join(f"[{ts.split('.')[0]}] {text}" for ts, text in deduped)
-    return " ".join(text for _, text in deduped)
 
 
 def _segs_to_text(segments: list[Any], include_timestamps: bool) -> str:
