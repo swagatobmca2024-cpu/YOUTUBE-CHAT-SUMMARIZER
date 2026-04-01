@@ -48,75 +48,110 @@ def extract_video_id(url: str) -> Optional[str]:
 
 def fetch_transcript(video_id: str, preferred_lang: str = "en", cookie_file: str = None) -> list[Document]:
     """
-    Fetch transcript - compatible with all youtube-transcript-api versions.
-    Supports cookies to bypass YouTube datacenter IP blocks.
+    Fetch transcript using yt-dlp (primary) with youtube-transcript-api as fallback.
+    yt-dlp is much more reliable on cloud servers.
     """
     import os
+    import json
+    import tempfile
+    import subprocess
+
     raw_entries = None
     last_error = None
 
-    # Build kwargs with optional cookies
-    # Check for cookies.txt in project root automatically
     cookies_path = None
     if cookie_file and os.path.exists(cookie_file):
         cookies_path = cookie_file
     elif os.path.exists("cookies.txt"):
         cookies_path = "cookies.txt"
 
-    cookie_kwargs = {"cookies": cookies_path} if cookies_path else {}
-
-    # Strategy 1: get_transcript() with language + cookies
+    # ── Strategy 1: yt-dlp (most reliable on cloud) ───────────────────────────
     try:
-        raw_entries = YouTubeTranscriptApi.get_transcript(
-            video_id, languages=[preferred_lang], **cookie_kwargs
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_template = os.path.join(tmpdir, "%(id)s")
+            cmd = [
+                "yt-dlp",
+                "--skip-download",
+                "--write-auto-sub",
+                "--write-sub",
+                "--sub-lang", preferred_lang,
+                "--sub-format", "json3",
+                "--convert-subs", "json3",
+                "-o", out_template,
+                f"https://www.youtube.com/watch?v={video_id}",
+            ]
+            if cookies_path:
+                cmd += ["--cookies", cookies_path]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+            # Find the downloaded subtitle file
+            sub_file = None
+            for f in os.listdir(tmpdir):
+                if f.endswith(".json3"):
+                    sub_file = os.path.join(tmpdir, f)
+                    break
+
+            if sub_file:
+                with open(sub_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                entries_temp = []
+                for event in data.get("events", []):
+                    start_ms = event.get("tStartMs", 0)
+                    segs = event.get("segs", [])
+                    text = "".join(s.get("utf8", "") for s in segs).strip()
+                    if text and text != "\n":
+                        entries_temp.append({
+                            "text": text,
+                            "start": start_ms / 1000.0,
+                        })
+
+                if entries_temp:
+                    raw_entries = entries_temp
+
     except Exception as e:
         last_error = e
 
-    # Strategy 2: get_transcript() without language preference
+    # ── Strategy 2: youtube-transcript-api direct ─────────────────────────────
     if raw_entries is None:
         try:
-            raw_entries = YouTubeTranscriptApi.get_transcript(
-                video_id, **cookie_kwargs
+            fetched = YouTubeTranscriptApi.get_transcript(
+                video_id, languages=[preferred_lang]
             )
+            raw_entries = fetched
         except Exception as e:
             last_error = e
 
-    # Strategy 3: list_transcripts() then fetch (newer API)
+    # ── Strategy 3: youtube-transcript-api any language ───────────────────────
     if raw_entries is None:
         try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(
-                video_id, **cookie_kwargs
-            )
-            transcript = None
-            try:
-                transcript = transcript_list.find_transcript([preferred_lang])
-            except Exception:
-                pass
-            if transcript is None:
-                try:
-                    transcript = transcript_list.find_generated_transcript([preferred_lang])
-                except Exception:
-                    pass
-            if transcript is None:
-                transcript = list(transcript_list)[0]
-
-            fetched = transcript.fetch()
-            entries_temp = []
-            for item in fetched:
-                if hasattr(item, 'text') and hasattr(item, 'start'):
-                    entries_temp.append({"text": item.text, "start": item.start})
-                elif isinstance(item, dict):
-                    entries_temp.append(item)
-            raw_entries = entries_temp if entries_temp else None
+            fetched = YouTubeTranscriptApi.get_transcript(video_id)
+            raw_entries = fetched
         except Exception as e:
             last_error = e
 
     if not raw_entries:
-        hint = ""
-        if not cookies_path:
-            hint = " 💡 Tip: Add a cookies.txt file to your project to bypass YouTube restrictions."
-        raise ValueError(f"Could not fetch transcript. Detail: {last_error}{hint}")
+        raise ValueError(
+            f"Could not fetch transcript. Please upload a cookies.txt file in the sidebar and try again. "
+            f"Detail: {last_error}"
+        )
+
+    # Normalize entries
+    entries = []
+    for item in raw_entries:
+        if isinstance(item, dict):
+            text = item.get("text", "").strip()
+            start = float(item.get("start", 0))
+            if text:
+                entries.append({"text": text, "start": start})
+        elif hasattr(item, "text"):
+            text = item.text.strip()
+            if text:
+                entries.append({"text": text, "start": float(item.start)})
+
+    if not entries:
+        raise ValueError("Transcript is empty.")
 
     # Normalize entries — handle both dict and object formats
     entries = []
