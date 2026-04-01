@@ -1,359 +1,320 @@
 """
-utils.py — Core logic for YouTube Video Summarizer & Q&A Bot
-=============================================================
-Handles:
-  - YouTube video ID extraction
-  - Transcript fetching (with timestamps, multilingual)
-  - Text chunking with overlap
-  - FAISS vector store creation (Google Embeddings)
-  - RAG-based Q&A with Gemini 2.0 Flash
-  - Full video summarization with timestamps
+utils.py — helper functions for YT Summarizer
+Compatible with Python 3.13+ (no walrus / match restrictions, standard typing).
 """
 
+from __future__ import annotations
+
+import json
 import re
-from typing import Optional
+import textwrap
+from typing import Any
+from urllib.parse import parse_qs, urlparse
 
+import requests
 from youtube_transcript_api import YouTubeTranscriptApi
-try:
-    from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
-except ImportError:
-    from youtube_transcript_api import TranscriptsDisabled, NoTranscriptFound
-
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain_community.vectorstores import FAISS
-from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-
-import google.generativeai as genai
+from youtube_transcript_api._errors import (
+    NoTranscriptFound,
+    TranscriptsDisabled,
+    VideoUnavailable,
+)
 
 
-# ── 1. Extract YouTube video ID ────────────────────────────────────────────────
+# ── Video ID extraction ───────────────────────────────────────────────────────
 
-def extract_video_id(url: str) -> Optional[str]:
-    patterns = [
-        r"(?:v=)([A-Za-z0-9_-]{11})",
-        r"youtu\.be/([A-Za-z0-9_-]{11})",
-        r"embed/([A-Za-z0-9_-]{11})",
-        r"shorts/([A-Za-z0-9_-]{11})",
-        r"m\.youtube\.com/watch\?v=([A-Za-z0-9_-]{11})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
+def extract_video_id(url: str) -> str | None:
+    """
+    Parse a YouTube video ID from a variety of URL formats:
+      - https://www.youtube.com/watch?v=VIDEO_ID
+      - https://youtu.be/VIDEO_ID
+      - https://youtube.com/shorts/VIDEO_ID
+      - https://www.youtube.com/embed/VIDEO_ID
+    Returns None if no valid ID is found.
+    """
+    url = url.strip()
+    parsed = urlparse(url)
+
+    # youtu.be short links
+    if parsed.netloc in ("youtu.be", "www.youtu.be"):
+        vid = parsed.path.lstrip("/").split("/")[0]
+        return vid if _valid_id(vid) else None
+
+    # Standard youtube.com paths
+    if "youtube.com" in parsed.netloc:
+        # /watch?v=...
+        qs = parse_qs(parsed.query)
+        if "v" in qs:
+            vid = qs["v"][0]
+            return vid if _valid_id(vid) else None
+        # /embed/ or /shorts/
+        match = re.search(r"(?:embed|shorts|v)/([A-Za-z0-9_-]{11})", parsed.path)
         if match:
             return match.group(1)
+
+    # Last-resort bare ID (11 char alphanumeric + - _)
+    match = re.fullmatch(r"[A-Za-z0-9_-]{11}", url)
+    if match:
+        return url
+
     return None
 
 
-# ── 2. Fetch transcript with timestamps (multilingual) ────────────────────────
+def _valid_id(vid: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{11}", vid))
 
-def fetch_transcript(video_id: str, preferred_lang: str = "en", cookie_file: str = None) -> list[Document]:
+
+# ── Video metadata (oembed, no API key needed) ────────────────────────────────
+
+def fetch_video_metadata(video_id: str) -> dict[str, Any] | None:
     """
-    Fetch transcript using yt-dlp (primary) with youtube-transcript-api as fallback.
-    yt-dlp is much more reliable on cloud servers.
+    Fetch lightweight metadata via YouTube oEmbed.
+    Returns a dict with keys: title, author, thumbnail, duration, views.
+    duration and views are best-effort (not available from oEmbed).
     """
-    import os
-    import json
-    import tempfile
-    import subprocess
-
-    raw_entries = None
-    last_error = None
-
-    cookies_path = None
-    if cookie_file and os.path.exists(cookie_file):
-        cookies_path = cookie_file
-    elif os.path.exists("cookies.txt"):
-        cookies_path = "cookies.txt"
-
-    # ── Strategy 1: yt-dlp (most reliable on cloud) ───────────────────────────
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            out_template = os.path.join(tmpdir, "%(id)s")
-            cmd = [
-                "yt-dlp",
-                "--skip-download",
-                "--write-auto-sub",
-                "--write-sub",
-                "--sub-lang", preferred_lang,
-                "--sub-format", "json3",
-                "--convert-subs", "json3",
-                "-o", out_template,
-                f"https://www.youtube.com/watch?v={video_id}",
-            ]
-            if cookies_path:
-                cmd += ["--cookies", cookies_path]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-
-            # Find the downloaded subtitle file
-            sub_file = None
-            for f in os.listdir(tmpdir):
-                if f.endswith(".json3"):
-                    sub_file = os.path.join(tmpdir, f)
-                    break
-
-            if sub_file:
-                with open(sub_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-
-                entries_temp = []
-                for event in data.get("events", []):
-                    start_ms = event.get("tStartMs", 0)
-                    segs = event.get("segs", [])
-                    text = "".join(s.get("utf8", "") for s in segs).strip()
-                    if text and text != "\n":
-                        entries_temp.append({
-                            "text": text,
-                            "start": start_ms / 1000.0,
-                        })
-
-                if entries_temp:
-                    raw_entries = entries_temp
-
-    except Exception as e:
-        last_error = e
-
-    # ── Strategy 2: youtube-transcript-api direct ─────────────────────────────
-    if raw_entries is None:
-        try:
-            fetched = YouTubeTranscriptApi.get_transcript(
-                video_id, languages=[preferred_lang]
-            )
-            raw_entries = fetched
-        except Exception as e:
-            last_error = e
-
-    # ── Strategy 3: youtube-transcript-api any language ───────────────────────
-    if raw_entries is None:
-        try:
-            fetched = YouTubeTranscriptApi.get_transcript(video_id)
-            raw_entries = fetched
-        except Exception as e:
-            last_error = e
-
-    if not raw_entries:
-        raise ValueError(
-            f"Could not fetch transcript. Please upload a cookies.txt file in the sidebar and try again. "
-            f"Detail: {last_error}"
+        oembed_url = (
+            f"https://www.youtube.com/oembed"
+            f"?url=https://www.youtube.com/watch?v={video_id}&format=json"
         )
-
-    # Normalize entries
-    entries = []
-    for item in raw_entries:
-        if isinstance(item, dict):
-            text = item.get("text", "").strip()
-            start = float(item.get("start", 0))
-            if text:
-                entries.append({"text": text, "start": start})
-        elif hasattr(item, "text"):
-            text = item.text.strip()
-            if text:
-                entries.append({"text": text, "start": float(item.start)})
-
-    if not entries:
-        raise ValueError("Transcript is empty.")
-
-    # Normalize entries — handle both dict and object formats
-    entries = []
-    for item in raw_entries:
-        if isinstance(item, dict):
-            entries.append({"text": item.get("text", ""), "start": float(item.get("start", 0))})
-        elif hasattr(item, 'text'):
-            entries.append({"text": item.text, "start": float(item.start)})
-
-    if not entries:
-        raise ValueError("Transcript is empty.")
-
-    WORDS_PER_CHUNK = 300
-    OVERLAP_ENTRIES = 3
-
-    chunks: list[Document] = []
-    current_text = []
-    current_start = entries[0]["start"]
-    word_count = 0
-    i = 0
-
-    while i < len(entries):
-        entry = entries[i]
-        words = entry["text"].split()
-        current_text.append(entry["text"])
-        word_count += len(words)
-
-        if word_count >= WORDS_PER_CHUNK or i == len(entries) - 1:
-            chunk_text = " ".join(current_text).strip()
-            chunks.append(Document(
-                page_content=chunk_text,
-                metadata={
-                    "start": int(current_start),
-                    "video_id": video_id,
-                },
-            ))
-            overlap_start = max(0, i - OVERLAP_ENTRIES + 1)
-            i = overlap_start
-            current_start = entries[i]["start"] if i < len(entries) else current_start
-            current_text = []
-            word_count = 0
-
-        i += 1
-
-    return chunks
+        resp = requests.get(oembed_url, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            return {
+                "title":     data.get("title", "Unknown Title"),
+                "author":    data.get("author_name", "Unknown"),
+                "thumbnail": data.get("thumbnail_url", ""),
+                "duration":  "N/A",   # oEmbed doesn't expose duration
+                "views":     "N/A",
+            }
+    except Exception:
+        pass
+    return None
 
 
-def get_available_languages(video_id: str) -> list[dict]:
-    """Return list of available transcript languages for a video."""
+# ── Transcript fetching ───────────────────────────────────────────────────────
+
+def fetch_transcript(
+    video_id: str,
+    include_timestamps: bool = False,
+) -> tuple[str, str | None]:
+    """
+    Fetch a YouTube transcript using youtube-transcript-api.
+
+    Returns:
+        (transcript_text, error_message)
+        On success error_message is None.
+    """
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        langs = []
-        for t in transcript_list:
-            langs.append({
-                "code": t.language_code,
-                "name": t.language,
-                "auto": t.is_generated,
-            })
-        return langs
-    except Exception:
-        return []
+
+        # Prefer manually created English; fallback to auto-generated; then any
+        try:
+            transcript = transcript_list.find_manually_created_transcript(["en"])
+        except NoTranscriptFound:
+            try:
+                transcript = transcript_list.find_generated_transcript(["en"])
+            except NoTranscriptFound:
+                transcript = next(iter(transcript_list))
+
+        segments = transcript.fetch()
+
+        if include_timestamps:
+            lines = []
+            for seg in segments:
+                ts  = _format_timestamp(seg.start)
+                lines.append(f"[{ts}] {seg.text}")
+            return "\n".join(lines), None
+        else:
+            return " ".join(seg.text for seg in segments), None
+
+    except TranscriptsDisabled:
+        return "", "Transcripts are disabled for this video."
+    except VideoUnavailable:
+        return "", "Video is unavailable or private."
+    except NoTranscriptFound:
+        return "", "No transcript found (video may not have captions)."
+    except Exception as exc:
+        return "", f"Unexpected error: {exc}"
 
 
-# ── 3. Build FAISS vector store with Google Embeddings ───────────────────────
-
-def build_vector_store(chunks: list[Document], gemini_key: str) -> FAISS:
-    """Embed transcript chunks with Google embeddings and store in FAISS."""
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
-        google_api_key=gemini_key,
-    )
-    vector_store = FAISS.from_documents(chunks, embeddings)
-    return vector_store
-
-
-# ── 4. Full Video Summarization with Timestamps ───────────────────────────────
-
-def summarize_video(
-    chunks: list[Document],
-    gemini_key: str,
-    output_language: str = "English",
-    summary_style: str = "Detailed",
-) -> str:
-    """
-    Generate a full video summary with timestamped sections using Gemini 2.0 Flash.
-    Supports output in any language.
-    """
-    genai.configure(api_key=gemini_key)
-
-    transcript_text = ""
-    for doc in chunks:
-        ts = format_timestamp(doc.metadata.get("start", 0))
-        transcript_text += f"[{ts}] {doc.page_content}\n\n"
-
-    style_instructions = {
-        "Brief": "Write a concise 3-5 sentence overview only.",
-        "Detailed": "Write a detailed summary with key points, organized by topic sections.",
-        "Bullet Points": "Summarize using bullet points grouped under topic headings.",
-        "Chapter-by-Chapter": "Break the video into chapters with a title and summary for each section.",
-    }
-
-    prompt = f"""You are an expert video summarizer.
-
-Analyze the following YouTube video transcript and produce a high-quality summary.
-
-OUTPUT LANGUAGE: {output_language}
-SUMMARY STYLE: {style_instructions.get(summary_style, style_instructions["Detailed"])}
-
-REQUIREMENTS:
-1. Start with a 2-sentence TL;DR overview.
-2. Include timestamped sections like [MM:SS] Topic Title — for every major topic shift.
-3. Highlight key insights, facts, or takeaways using ✦ bullets.
-4. End with a "Key Takeaways" section listing the 3-5 most important points.
-5. Write everything in {output_language}.
-
-TRANSCRIPT:
-{transcript_text[:14000]}
-
-Produce the summary now:"""
-
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    response = model.generate_content(prompt)
-    return response.text
-
-
-# ── 5. RAG Q&A with Gemini 2.0 Flash ─────────────────────────────────────────
-
-SYSTEM_PROMPT = """You are an expert video assistant that answers questions strictly based on a YouTube video transcript.
-
-Rules:
-- Only use information from the transcript context provided.
-- If the answer is not in the transcript, say: "I couldn't find that in the video."
-- Be concise and direct. Use bullet points for lists.
-- When referencing specific moments, mention the timestamp.
-- Never make up information or draw on outside knowledge.
-- Respond in the same language as the user's question.
-
-Transcript context:
-{context}
-"""
-
-def get_answer(
-    question: str,
-    vector_store: FAISS,
-    gemini_key: str,
-    chat_history: list[dict] = None,
-    top_k: int = 5,
-) -> tuple[str, list[int]]:
-    """
-    Retrieve relevant transcript chunks and generate an answer using Gemini 2.0 Flash.
-    Returns answer string and list of source timestamps (seconds).
-    """
-    retriever = vector_store.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": top_k},
-    )
-    relevant_docs = retriever.invoke(question)
-    relevant_docs.sort(key=lambda d: d.metadata.get("start", 0))
-
-    context_parts = []
-    for doc in relevant_docs:
-        ts = format_timestamp(doc.metadata.get("start", 0))
-        context_parts.append(f"[{ts}] {doc.page_content}")
-    context = "\n\n".join(context_parts)
-
-    messages = [SystemMessage(content=SYSTEM_PROMPT.format(context=context))]
-
-    if chat_history:
-        for msg in chat_history[-8:]:
-            if msg["role"] == "user":
-                messages.append(HumanMessage(content=msg["content"]))
-            elif msg["role"] == "assistant":
-                messages.append(AIMessage(content=msg["content"]))
-
-    messages.append(HumanMessage(content=question))
-
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash",
-        google_api_key=gemini_key,
-        temperature=0.2,
-        max_output_tokens=1024,
-    )
-    response = llm.invoke(messages)
-    answer = response.content
-
-    sources = sorted({
-        int(doc.metadata.get("start", 0))
-        for doc in relevant_docs
-        if doc.metadata.get("start") is not None
-    })
-
-    return answer, sources
-
-
-# ── 6. Timestamp formatter ────────────────────────────────────────────────────
-
-def format_timestamp(seconds: int) -> str:
-    """Convert seconds to MM:SS or H:MM:SS format."""
+def _format_timestamp(seconds: float) -> str:
     seconds = int(seconds)
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    secs = seconds % 60
-    if hours > 0:
-        return f"{hours}:{minutes:02d}:{secs:02d}"
-    return f"{minutes}:{secs:02d}"
+    h, r = divmod(seconds, 3600)
+    m, s = divmod(r, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+# ── Gemini API helper ─────────────────────────────────────────────────────────
+
+_GEMINI_ENDPOINT = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.0-flash:generateContent"
+)
+
+_STYLE_INSTRUCTIONS: dict[str, str] = {
+    "Concise":         "Provide a concise summary in 3-5 short paragraphs.",
+    "Detailed":        "Provide a thorough, detailed summary covering all major topics discussed.",
+    "Bullet Points":   "Summarize using clearly organized bullet points grouped by topic.",
+    "Executive Brief": (
+        "Write an executive brief: one-line TL;DR, followed by 3-5 high-impact insights, "
+        "and a recommended action or takeaway."
+    ),
+}
+
+
+def _call_gemini(prompt: str, api_key: str, max_tokens: int = 1024) -> str:
+    """Low-level call to Gemini generateContent REST endpoint."""
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature": 0.4,
+            "topP": 0.9,
+        },
+    }
+    resp = requests.post(
+        f"{_GEMINI_ENDPOINT}?key={api_key}",
+        headers=headers,
+        json=payload,
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except (KeyError, IndexError) as exc:
+        raise ValueError(f"Unexpected Gemini response structure: {data}") from exc
+
+
+# ── Public AI functions ───────────────────────────────────────────────────────
+
+def summarize_with_gemini(
+    transcript: str,
+    api_key: str,
+    style: str = "Concise",
+    language: str = "English",
+    max_tokens: int = 1024,
+) -> str:
+    """Generate a summary of the transcript using Gemini."""
+    style_instruction = _STYLE_INSTRUCTIONS.get(style, _STYLE_INSTRUCTIONS["Concise"])
+    # Truncate transcript to stay within model context limits (~30k chars)
+    safe_transcript = transcript[:30_000]
+
+    prompt = textwrap.dedent(f"""
+        You are an expert content analyst. Your task is to summarize a YouTube video transcript.
+
+        Style instruction: {style_instruction}
+        Output language: {language}
+
+        Transcript:
+        {safe_transcript}
+
+        Provide only the summary. Do not include preamble or meta-commentary.
+    """).strip()
+
+    return _call_gemini(prompt, api_key, max_tokens)
+
+
+def generate_key_points(
+    transcript: str,
+    api_key: str,
+    max_tokens: int = 1024,
+) -> list[str] | str:
+    """
+    Extract the top key points from the transcript.
+    Returns a list of strings if JSON parsing succeeds, else raw text.
+    """
+    safe_transcript = transcript[:30_000]
+    prompt = textwrap.dedent(f"""
+        Extract the 7 most important key points from the following YouTube transcript.
+        Respond ONLY with a valid JSON array of strings, e.g.:
+        ["Point one.", "Point two.", ...]
+        Do not include any other text.
+
+        Transcript:
+        {safe_transcript}
+    """).strip()
+
+    raw = _call_gemini(prompt, api_key, max_tokens)
+
+    # Try to parse JSON
+    try:
+        # Strip possible markdown fences
+        clean = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+        points = json.loads(clean)
+        if isinstance(points, list):
+            return [str(p) for p in points]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    return raw  # fallback: return raw text
+
+
+def generate_quiz(
+    transcript: str,
+    api_key: str,
+    n_questions: int = 5,
+) -> list[dict[str, str]] | str:
+    """
+    Generate n quiz Q&A pairs from the transcript.
+    Returns list of {question, answer, explanation} dicts on success.
+    """
+    safe_transcript = transcript[:25_000]
+    prompt = textwrap.dedent(f"""
+        Based on the following YouTube transcript, create {n_questions} comprehension questions.
+        Respond ONLY with a valid JSON array like:
+        [
+          {{
+            "question": "...",
+            "answer": "...",
+            "explanation": "..."
+          }}
+        ]
+        Do not include any other text or markdown fences.
+
+        Transcript:
+        {safe_transcript}
+    """).strip()
+
+    raw = _call_gemini(prompt, api_key, 1024)
+
+    try:
+        clean = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+        items = json.loads(clean)
+        if isinstance(items, list):
+            return items
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    return raw
+
+
+# ── Export helpers ────────────────────────────────────────────────────────────
+
+def export_summary_as_txt(
+    title: str,
+    summary: str,
+    key_points: list[str] | str,
+) -> str:
+    """Return a plain-text export string of the summary + key points."""
+    sep = "=" * 60
+    lines = [
+        sep,
+        f"YouTube Video Summary: {title}",
+        sep,
+        "",
+        "SUMMARY",
+        "-------",
+        summary,
+        "",
+        "KEY POINTS",
+        "----------",
+    ]
+    if isinstance(key_points, list):
+        for i, pt in enumerate(key_points, 1):
+            lines.append(f"{i}. {pt}")
+    else:
+        lines.append(key_points)
+    lines += ["", sep]
+    return "\n".join(lines)
