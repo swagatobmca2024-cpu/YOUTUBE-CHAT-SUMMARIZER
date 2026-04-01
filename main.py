@@ -44,20 +44,16 @@ st.markdown("""
     color: var(--text-primary);
   }
 
-  /* Sidebar */
   [data-testid="stSidebar"] {
     background: var(--bg-card) !important;
     border-right: 1px solid var(--border);
   }
   [data-testid="stSidebar"] * { color: var(--text-primary) !important; }
 
-  /* Hide default Streamlit chrome */
   #MainMenu, footer, header { visibility: hidden; }
 
-  /* Headings */
   h1, h2, h3 { font-family: 'Space Mono', monospace !important; }
 
-  /* Inputs */
   .stTextInput > div > div > input,
   .stTextArea > div > textarea,
   .stSelectbox > div > div {
@@ -74,7 +70,6 @@ st.markdown("""
     box-shadow: 0 0 0 3px var(--accent-glow) !important;
   }
 
-  /* Primary button */
   .stButton > button {
     background: linear-gradient(135deg, var(--accent), #5b21b6) !important;
     color: #fff !important;
@@ -91,7 +86,6 @@ st.markdown("""
     box-shadow: 0 0 18px var(--accent-glow) !important;
   }
 
-  /* Download button */
   .stDownloadButton > button {
     background: var(--bg-elevated) !important;
     border: 1px solid var(--accent) !important;
@@ -101,7 +95,6 @@ st.markdown("""
     font-size: 0.8rem !important;
   }
 
-  /* Tabs */
   .stTabs [data-baseweb="tab-list"] {
     background: var(--bg-card) !important;
     border-bottom: 1px solid var(--border) !important;
@@ -121,7 +114,6 @@ st.markdown("""
     border-bottom: 2px solid var(--accent) !important;
   }
 
-  /* Expander */
   .streamlit-expanderHeader {
     background: var(--bg-elevated) !important;
     border: 1px solid var(--border) !important;
@@ -137,23 +129,24 @@ st.markdown("""
     border-radius: 0 0 8px 8px !important;
   }
 
-  /* Metric cards */
   [data-testid="metric-container"] {
     background: var(--bg-elevated) !important;
     border: 1px solid var(--border) !important;
     border-radius: 10px !important;
     padding: 1rem !important;
   }
-  [data-testid="metric-container"] label { color: var(--text-muted) !important; font-size: 0.75rem !important; }
-  [data-testid="metric-container"] [data-testid="stMetricValue"] { color: var(--accent-light) !important; font-family: 'Space Mono', monospace !important; }
+  [data-testid="metric-container"] label {
+    color: var(--text-muted) !important;
+    font-size: 0.75rem !important;
+  }
+  [data-testid="metric-container"] [data-testid="stMetricValue"] {
+    color: var(--accent-light) !important;
+    font-family: 'Space Mono', monospace !important;
+  }
 
-  /* Alerts / info boxes */
   .stAlert { border-radius: 8px !important; border-left-width: 3px !important; }
-
-  /* Spinner */
   .stSpinner > div { border-top-color: var(--accent) !important; }
 
-  /* Custom card */
   .yt-card {
     background: var(--bg-card);
     border: 1px solid var(--border);
@@ -215,13 +208,13 @@ with st.sidebar:
     st.markdown("### ▶ YT Summarizer")
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
-    # API key from secrets
+    # ── API key ───────────────────────────────────────────────────────────────
+    api_key: str | None = None
     try:
         api_key = st.secrets["GEMINI_API_KEY"]
         st.success("API key loaded ✓", icon="🔑")
-    except Exception:
+    except (KeyError, FileNotFoundError):
         st.error("Add GEMINI_API_KEY to .streamlit/secrets.toml", icon="⚠")
-        api_key = None
 
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
     st.markdown("**Settings**")
@@ -247,21 +240,34 @@ with st.sidebar:
         "[Get cookies.txt](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) "
         "Chrome extension while logged into YouTube."
     )
-    cookies_file = st.file_uploader(
+
+    # ── Cookies: file uploader takes priority, then secrets fallback ──────────
+    cookies_txt: str | None = None
+
+    uploaded_cookies = st.file_uploader(
         "cookies.txt (optional)",
         type=["txt"],
         label_visibility="collapsed",
     )
-    cookies_txt: str | None = None
-    if cookies_file is not None:
-        cookies_txt = cookies_file.read().decode("utf-8", errors="ignore")
-        st.success("Cookies loaded ✓", icon="🍪")
-    else:
-        # Also try st.secrets fallback
+    if uploaded_cookies is not None:
         try:
-            cookies_txt = st.secrets["YT_COOKIES"]
-            st.success("Cookies loaded from secrets ✓", icon="🍪")
-        except Exception:
+            cookies_txt = uploaded_cookies.read().decode("utf-8", errors="ignore")
+            if cookies_txt.strip():
+                st.success("Cookies loaded ✓", icon="🍪")
+            else:
+                st.warning("Uploaded file appears empty.", icon="⚠")
+                cookies_txt = None
+        except Exception as exc:
+            st.error(f"Could not read cookies file: {exc}", icon="⚠")
+            cookies_txt = None
+    else:
+        # Fallback: read from Streamlit secrets
+        try:
+            secret_cookies = st.secrets["YT_COOKIES"]
+            if secret_cookies and secret_cookies.strip():
+                cookies_txt = secret_cookies
+                st.success("Cookies loaded from secrets ✓", icon="🍪")
+        except (KeyError, FileNotFoundError):
             cookies_txt = None
 
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
@@ -311,10 +317,11 @@ if run:
 
     if meta:
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("▶ Title", meta.get("title", "—")[:30] + "…" if len(meta.get("title", "")) > 30 else meta.get("title", "—"))
-        m2.metric("👤 Channel", meta.get("author", "—"))
+        raw_title = meta.get("title", "—")
+        m1.metric("▶ Title", raw_title[:30] + "…" if len(raw_title) > 30 else raw_title)
+        m2.metric("👤 Channel",  meta.get("author", "—"))
         m3.metric("⏱ Duration", meta.get("duration", "—"))
-        m4.metric("👁 Views", meta.get("views", "—"))
+        m4.metric("👁 Views",    meta.get("views", "—"))
 
         thumb = meta.get("thumbnail")
         if thumb:
@@ -326,7 +333,9 @@ if run:
     # ── Fetch transcript ──────────────────────────────────────────────────────
     with st.spinner("Extracting transcript…"):
         transcript, transcript_error = fetch_transcript(
-            video_id, include_timestamps, cookies_txt=cookies_txt
+            video_id,
+            include_timestamps=include_timestamps,
+            cookies_txt=cookies_txt,
         )
 
     if transcript_error:
@@ -365,7 +374,9 @@ if "summary" in st.session_state:
     quiz       = st.session_state["quiz"]
     transcript = st.session_state["transcript"]
 
-    tab1, tab2, tab3, tab4 = st.tabs(["📝 Summary", "🎯 Key Points", "❓ Quiz", "📄 Transcript"])
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["📝 Summary", "🎯 Key Points", "❓ Quiz", "📄 Transcript"]
+    )
 
     with tab1:
         st.markdown('<div class="yt-card">', unsafe_allow_html=True)
@@ -408,7 +419,12 @@ if "summary" in st.session_state:
 
     with tab4:
         with st.expander("Full transcript", expanded=False):
-            st.text_area("", value=transcript, height=420, label_visibility="collapsed")
+            st.text_area(
+                "",
+                value=transcript,
+                height=420,
+                label_visibility="collapsed",
+            )
         st.download_button(
             "⬇ Download Transcript (.txt)",
             data=transcript,
