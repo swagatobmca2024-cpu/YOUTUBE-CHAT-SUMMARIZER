@@ -240,6 +240,31 @@ with st.sidebar:
     include_timestamps = st.toggle("Include timestamps", value=False)
 
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
+    st.markdown("**🍪 YouTube Cookies**")
+    st.caption(
+        "If transcript fetching is blocked, upload your `cookies.txt` "
+        "(Netscape format). Export it with the "
+        "[Get cookies.txt](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) "
+        "Chrome extension while logged into YouTube."
+    )
+    cookies_file = st.file_uploader(
+        "cookies.txt (optional)",
+        type=["txt"],
+        label_visibility="collapsed",
+    )
+    cookies_txt: str | None = None
+    if cookies_file is not None:
+        cookies_txt = cookies_file.read().decode("utf-8", errors="ignore")
+        st.success("Cookies loaded ✓", icon="🍪")
+    else:
+        # Also try st.secrets fallback
+        try:
+            cookies_txt = st.secrets["YT_COOKIES"]
+            st.success("Cookies loaded from secrets ✓", icon="🍪")
+        except Exception:
+            cookies_txt = None
+
+    st.markdown('<hr class="divider">', unsafe_allow_html=True)
     st.markdown(
         '<span class="badge">Gemini 2.0 Flash</span>'
         '<span class="badge">v1.0.0</span>',
@@ -300,7 +325,9 @@ if run:
 
     # ── Fetch transcript ──────────────────────────────────────────────────────
     with st.spinner("Extracting transcript…"):
-        transcript, transcript_error = fetch_transcript(video_id, include_timestamps)
+        transcript, transcript_error = fetch_transcript(
+            video_id, include_timestamps, cookies_txt=cookies_txt
+        )
 
     if transcript_error:
         st.error(f"Transcript error: {transcript_error}")
