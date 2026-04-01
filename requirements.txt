@@ -1,6 +1,5 @@
 # requirements.txt — YouTube Summarizer
-# Python >= 3.11 compatible (tested on 3.13)
-
 streamlit>=1.40.0
 youtube-transcript-api>=1.0.0
 requests>=2.32.0
+yt-dlp>=2024.1.0
