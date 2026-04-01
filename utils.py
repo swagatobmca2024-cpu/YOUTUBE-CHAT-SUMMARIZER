@@ -48,51 +48,67 @@ def extract_video_id(url: str) -> Optional[str]:
 
 def fetch_transcript(video_id: str, preferred_lang: str = "en") -> list[Document]:
     """
-    Fetch transcript for a YouTube video. Compatible with both old and new
-    youtube-transcript-api versions. Falls back gracefully.
+    Fetch transcript - compatible with all youtube-transcript-api versions.
     """
-    try:
-        entries = None
+    raw_entries = None
+    last_error = None
 
-        # New API style (>=0.6.x): FetchedTranscript objects
+    # Strategy 1: get_transcript() directly (works in most versions)
+    try:
+        raw_entries = YouTubeTranscriptApi.get_transcript(video_id, languages=[preferred_lang])
+    except Exception as e:
+        last_error = e
+
+    # Strategy 2: get_transcript() without language preference
+    if raw_entries is None:
+        try:
+            raw_entries = YouTubeTranscriptApi.get_transcript(video_id)
+        except Exception as e:
+            last_error = e
+
+    # Strategy 3: list_transcripts() then fetch (newer API)
+    if raw_entries is None:
         try:
             transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
             transcript = None
-
             try:
                 transcript = transcript_list.find_transcript([preferred_lang])
             except Exception:
                 pass
-
             if transcript is None:
                 try:
                     transcript = transcript_list.find_generated_transcript([preferred_lang])
                 except Exception:
                     pass
-
             if transcript is None:
-                available = list(transcript_list)
-                if available:
-                    transcript = available[0]
+                transcript = list(transcript_list)[0]
 
-            if transcript is not None:
-                fetched = transcript.fetch()
-                # Handle both object-style and dict-style entries
-                if fetched and hasattr(fetched[0], 'text'):
-                    entries = [{"text": s.text, "start": s.start} for s in fetched]
-                else:
-                    entries = fetched
+            fetched = transcript.fetch()
 
-        except Exception:
-            # Fallback: direct fetch without language selection
-            fetched = YouTubeTranscriptApi.get_transcript(video_id)
-            entries = fetched
+            # New API returns FetchedTranscript object — iterate it
+            entries_temp = []
+            for item in fetched:
+                if hasattr(item, 'text') and hasattr(item, 'start'):
+                    entries_temp.append({"text": item.text, "start": item.start})
+                elif isinstance(item, dict):
+                    entries_temp.append(item)
+            raw_entries = entries_temp if entries_temp else None
+        except Exception as e:
+            last_error = e
 
-    except Exception as e:
-        raise ValueError(f"Failed to fetch transcript: {e}")
+    if not raw_entries:
+        raise ValueError(f"Could not fetch transcript. The video may have captions disabled, or be private/age-restricted. Detail: {last_error}")
+
+    # Normalize entries — handle both dict and object formats
+    entries = []
+    for item in raw_entries:
+        if isinstance(item, dict):
+            entries.append({"text": item.get("text", ""), "start": float(item.get("start", 0))})
+        elif hasattr(item, 'text'):
+            entries.append({"text": item.text, "start": float(item.start)})
 
     if not entries:
-        raise ValueError("Transcript is empty or unavailable for this video.")
+        raise ValueError("Transcript is empty.")
 
     WORDS_PER_CHUNK = 300
     OVERLAP_ENTRIES = 3
