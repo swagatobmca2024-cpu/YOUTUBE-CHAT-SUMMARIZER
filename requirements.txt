@@ -1,5 +1,5 @@
 streamlit>=1.35.0
-youtube-transcript-api>=0.6.2
+youtube-transcript-api==0.6.3
 langchain>=0.3.0
 langchain-core>=0.3.0
 langchain-google-genai>=2.0.0
