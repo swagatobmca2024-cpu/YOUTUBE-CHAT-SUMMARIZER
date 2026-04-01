@@ -21,7 +21,8 @@ from youtube_transcript_api import (
 
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
-from langchain.schema import Document, HumanMessage, AIMessage, SystemMessage
+from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 import google.generativeai as genai
 
