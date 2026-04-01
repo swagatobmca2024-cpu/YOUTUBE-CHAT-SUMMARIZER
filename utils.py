@@ -5,6 +5,7 @@ Compatible with Python 3.11+
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import textwrap
@@ -198,12 +199,60 @@ def _oembed_metadata(video_id: str) -> dict[str, Any] | None:
 
 # ── Transcript fetching ───────────────────────────────────────────────────────
 
+def _parse_netscape_cookies(cookies_txt: str) -> list[dict]:
+    """
+    Parse a Netscape-format cookies.txt into a list of cookie dicts.
+    Lines look like:
+      .youtube.com  TRUE  /  FALSE  0  COOKIE_NAME  cookie_value
+    """
+    cookies = []
+    for line in cookies_txt.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        domain, _, path, secure, _, name, value = parts[:7]
+        cookies.append({
+            "domain": domain,
+            "path": path,
+            "secure": secure.upper() == "TRUE",
+            "name": name,
+            "value": value,
+        })
+    return cookies
+
+
+def _session_from_cookies(cookies_txt: str | None) -> requests.Session:
+    """
+    Build a requests.Session with browser-like headers.
+    If cookies_txt (Netscape format) is provided, load them so
+    YouTube accepts requests from cloud server IPs.
+    """
+    session = requests.Session()
+    session.headers.update(_YT_HEADERS)
+    # Always set basic consent cookies
+    session.cookies.set("CONSENT", "YES+cb", domain=".youtube.com")
+    session.cookies.set("SOCS", "CAESEwgDEgk0OTc5NTkzNzIaAmVuIAEaBgiAo_CmBg", domain=".youtube.com")
+
+    if cookies_txt:
+        for ck in _parse_netscape_cookies(cookies_txt):
+            session.cookies.set(
+                ck["name"], ck["value"],
+                domain=ck["domain"], path=ck["path"],
+            )
+    return session
+
+
 def fetch_transcript(
     video_id: str,
     include_timestamps: bool = False,
+    cookies_txt: str | None = None,
 ) -> tuple[str, str | None]:
     """
-    Fetch transcript using youtube-transcript-api v1.x only.
+    Fetch transcript using youtube-transcript-api v1.x.
+    Pass cookies_txt (Netscape format) to bypass YouTube IP blocks on cloud servers.
     Returns (text, error). error is None on success.
     """
     def _best_transcript(tlist):
@@ -215,30 +264,48 @@ def fetch_transcript(
             return tlist.find_generated_transcript(["en"])
         except NoTranscriptFound:
             pass
-        return next(iter(tlist))  # any language
+        return next(iter(tlist))
 
-    try:
-        ytt = YouTubeTranscriptApi()
-        tlist = ytt.list(video_id)
-        segs = _best_transcript(tlist).fetch()
-        return _segs_to_text(segs, include_timestamps), None
+    def _run(session: requests.Session | None) -> tuple[str, str | None]:
+        try:
+            ytt = YouTubeTranscriptApi(http_client=session) if session else YouTubeTranscriptApi()
+            tlist = ytt.list(video_id)
+            segs = _best_transcript(tlist).fetch()
+            return _segs_to_text(segs, include_timestamps), None
+        except TranscriptsDisabled:
+            return "", "Transcripts are disabled for this video."
+        except VideoUnavailable:
+            return "", "Video is unavailable or private."
+        except NoTranscriptFound:
+            return "", "No transcript found — video may not have captions."
+        except (RequestBlocked, CouldNotRetrieveTranscript):
+            return "", "__blocked__"
+        except Exception as e:
+            return "", f"Unexpected error: {e}"
 
-    except TranscriptsDisabled:
-        return "", "Transcripts are disabled for this video."
-    except VideoUnavailable:
-        return "", "Video is unavailable or private."
-    except NoTranscriptFound:
-        return "", "No transcript found — video may not have captions."
-    except RequestBlocked:
+    # Attempt 1 — with cookies + browser headers (best chance on cloud)
+    session = _session_from_cookies(cookies_txt)
+    text, err = _run(session)
+    if text or (err and err != "__blocked__"):
+        return text, err
+
+    # Attempt 2 — plain session (different code path)
+    text, err = _run(None)
+    if text or (err and err != "__blocked__"):
+        return text, err
+
+    # Both attempts blocked
+    if cookies_txt:
         return "", (
-            "YouTube is blocking requests from this server's IP address. "
-            "Run the app locally, or add your YouTube `cookies.txt` "
-            "as a `YT_COOKIES` secret in Streamlit Cloud."
+            "YouTube is still blocking requests even with the provided cookies. "
+            "Try exporting fresh cookies while actively logged into YouTube, "
+            "then re-upload the file."
         )
-    except CouldNotRetrieveTranscript as e:
-        return "", f"Could not retrieve transcript: {e}"
-    except Exception as e:
-        return "", f"Unexpected error: {e}"
+    return "", (
+        "YouTube is blocking transcript requests from this server's IP. "
+        "**Fix:** upload your `cookies.txt` in the sidebar "
+        "(export it with the *Get cookies.txt* Chrome extension while logged into YouTube)."
+    )
 
 
 def _segs_to_text(segments: list[Any], include_timestamps: bool) -> str:
