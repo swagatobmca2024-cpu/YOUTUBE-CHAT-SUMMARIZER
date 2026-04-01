@@ -13,11 +13,11 @@ Handles:
 import re
 from typing import Optional
 
-from youtube_transcript_api import (
-    YouTubeTranscriptApi,
-    TranscriptsDisabled,
-    NoTranscriptFound,
-)
+from youtube_transcript_api import YouTubeTranscriptApi
+try:
+    from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
+except ImportError:
+    from youtube_transcript_api import TranscriptsDisabled, NoTranscriptFound
 
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
@@ -48,41 +48,51 @@ def extract_video_id(url: str) -> Optional[str]:
 
 def fetch_transcript(video_id: str, preferred_lang: str = "en") -> list[Document]:
     """
-    Fetch transcript for a YouTube video. Tries preferred language first,
-    falls back to any available transcript.
+    Fetch transcript for a YouTube video. Compatible with both old and new
+    youtube-transcript-api versions. Falls back gracefully.
     """
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        transcript = None
+        entries = None
 
+        # New API style (>=0.6.x): FetchedTranscript objects
         try:
-            transcript = transcript_list.find_transcript([preferred_lang])
-        except Exception:
-            pass
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            transcript = None
 
-        if transcript is None:
             try:
-                transcript = transcript_list.find_generated_transcript([preferred_lang])
+                transcript = transcript_list.find_transcript([preferred_lang])
             except Exception:
                 pass
 
-        if transcript is None:
-            available = list(transcript_list)
-            if not available:
-                raise ValueError("No transcripts available for this video.")
-            transcript = available[0]
+            if transcript is None:
+                try:
+                    transcript = transcript_list.find_generated_transcript([preferred_lang])
+                except Exception:
+                    pass
 
-        entries = transcript.fetch()
+            if transcript is None:
+                available = list(transcript_list)
+                if available:
+                    transcript = available[0]
 
-    except TranscriptsDisabled:
-        raise ValueError("Transcripts are disabled for this video.")
-    except NoTranscriptFound:
-        raise ValueError("No transcript found for this video.")
+            if transcript is not None:
+                fetched = transcript.fetch()
+                # Handle both object-style and dict-style entries
+                if fetched and hasattr(fetched[0], 'text'):
+                    entries = [{"text": s.text, "start": s.start} for s in fetched]
+                else:
+                    entries = fetched
+
+        except Exception:
+            # Fallback: direct fetch without language selection
+            fetched = YouTubeTranscriptApi.get_transcript(video_id)
+            entries = fetched
+
     except Exception as e:
         raise ValueError(f"Failed to fetch transcript: {e}")
 
     if not entries:
-        raise ValueError("Transcript is empty.")
+        raise ValueError("Transcript is empty or unavailable for this video.")
 
     WORDS_PER_CHUNK = 300
     OVERLAP_ENTRIES = 3
