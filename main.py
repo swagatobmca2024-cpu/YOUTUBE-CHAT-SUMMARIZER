@@ -295,6 +295,14 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Session state init ─────────────────────────────────────────────────────────
+
+# Auto-load Gemini key from Streamlit secrets if available
+_default_key = ""
+try:
+    _default_key = st.secrets.get("GEMINI_API_KEY", "")
+except Exception:
+    pass
+
 defaults = {
     "messages": [],
     "vector_store": None,
@@ -302,7 +310,7 @@ defaults = {
     "transcript_chunks": [],
     "video_loaded": False,
     "summary": None,
-    "gemini_key": "",
+    "gemini_key": _default_key,
     "available_langs": [],
 }
 for k, v in defaults.items():
