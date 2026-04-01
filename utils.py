@@ -17,6 +17,8 @@ from youtube_transcript_api._errors import (
     NoTranscriptFound,
     TranscriptsDisabled,
     VideoUnavailable,
+    RequestBlocked,
+    CouldNotRetrieveTranscript,
 )
 
 
@@ -98,14 +100,16 @@ def fetch_transcript(
     include_timestamps: bool = False,
 ) -> tuple[str, str | None]:
     """
-    Fetch a YouTube transcript using youtube-transcript-api.
+    Fetch a YouTube transcript using youtube-transcript-api v1.x.
+    The new API is instance-based: YouTubeTranscriptApi().list(video_id)
 
     Returns:
         (transcript_text, error_message)
         On success error_message is None.
     """
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        ytt = YouTubeTranscriptApi()
+        transcript_list = ytt.list(video_id)
 
         # Prefer manually created English; fallback to auto-generated; then any
         try:
@@ -114,6 +118,7 @@ def fetch_transcript(
             try:
                 transcript = transcript_list.find_generated_transcript(["en"])
             except NoTranscriptFound:
+                # Take whatever is available
                 transcript = next(iter(transcript_list))
 
         segments = transcript.fetch()
@@ -121,7 +126,7 @@ def fetch_transcript(
         if include_timestamps:
             lines = []
             for seg in segments:
-                ts  = _format_timestamp(seg.start)
+                ts = _format_timestamp(seg.start)
                 lines.append(f"[{ts}] {seg.text}")
             return "\n".join(lines), None
         else:
@@ -133,6 +138,13 @@ def fetch_transcript(
         return "", "Video is unavailable or private."
     except NoTranscriptFound:
         return "", "No transcript found (video may not have captions)."
+    except RequestBlocked:
+        return "", (
+            "YouTube blocked the request. This often happens on cloud servers. "
+            "Try running locally or configure a proxy in utils.py."
+        )
+    except CouldNotRetrieveTranscript as exc:
+        return "", f"Could not retrieve transcript: {exc}"
     except Exception as exc:
         return "", f"Unexpected error: {exc}"
 
