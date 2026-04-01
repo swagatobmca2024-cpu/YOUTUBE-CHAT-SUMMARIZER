@@ -268,12 +268,20 @@ def fetch_transcript(
     video_id: str,
     include_timestamps: bool = False,
     cookies_txt: str | None = None,
+    proxy_user: str | None = None,
+    proxy_pass: str | None = None,
 ) -> tuple[str, str | None]:
     """
     Fetch transcript using youtube-transcript-api v1.x.
-    Pass cookies_txt (Netscape format) to bypass YouTube IP blocks on cloud.
+
+    Attempt order (stops at first success):
+      1. Webshare residential proxy  — bypasses Streamlit Cloud IP blocks
+      2. Browser-spoofed session + cookies (if provided)
+      3. Bare default session
+
     Returns (text, error_message). error_message is None on success.
     """
+    from youtube_transcript_api.proxies import WebshareProxyConfig
 
     def _best_transcript(tlist):
         try:
@@ -284,18 +292,12 @@ def fetch_transcript(
             return tlist.find_generated_transcript(["en"])
         except NoTranscriptFound:
             pass
-        # Fall back to the first available transcript in any language
         return next(iter(tlist))
 
-    def _run(session: requests.Session | None) -> tuple[str, str | None]:
+    def _run(ytt: YouTubeTranscriptApi) -> tuple[str, str | None]:
         try:
-            ytt = (
-                YouTubeTranscriptApi(http_client=session)
-                if session is not None
-                else YouTubeTranscriptApi()
-            )
-            tlist  = ytt.list(video_id)
-            segs   = _best_transcript(tlist).fetch()
+            tlist = ytt.list(video_id)
+            segs  = _best_transcript(tlist).fetch()
             return _segs_to_text(segs, include_timestamps), None
         except TranscriptsDisabled:
             return "", "Transcripts are disabled for this video."
@@ -308,28 +310,41 @@ def fetch_transcript(
         except Exception as exc:
             return "", f"Unexpected error: {exc}"
 
-    # Attempt 1 — with browser-spoofed session (+ user cookies if provided)
+    # ── Attempt 1: Webshare proxy (residential IP — works on Streamlit Cloud) ──
+    if proxy_user and proxy_pass:
+        try:
+            proxy_cfg = WebshareProxyConfig(
+                proxy_username=proxy_user,
+                proxy_password=proxy_pass,
+            )
+            text, err = _run(YouTubeTranscriptApi(proxy_config=proxy_cfg))
+            if text or (err and err != "__blocked__"):
+                return text, err
+        except Exception:
+            pass  # proxy init failed — fall through to next attempt
+
+    # ── Attempt 2: browser-spoofed session + optional cookies ─────────────────
     session = _session_from_cookies(cookies_txt)
-    text, err = _run(session)
+    text, err = _run(YouTubeTranscriptApi(http_client=session))
     if text or (err and err != "__blocked__"):
         return text, err
 
-    # Attempt 2 — bare session (different internal code path)
-    text, err = _run(None)
+    # ── Attempt 3: bare default session ───────────────────────────────────────
+    text, err = _run(YouTubeTranscriptApi())
     if text or (err and err != "__blocked__"):
         return text, err
 
-    # Both attempts were blocked
-    if cookies_txt:
+    # All attempts blocked
+    if proxy_user and proxy_pass:
         return "", (
-            "YouTube is still blocking requests even with the provided cookies. "
-            "Try exporting fresh cookies while actively logged into YouTube, "
-            "then re-upload the file."
+            "All fetch attempts failed (including Webshare proxy). "
+            "Your proxy credentials may be incorrect or your free quota exhausted. "
+            "Check your Webshare dashboard and verify the credentials in Streamlit secrets."
         )
     return "", (
-        "YouTube is blocking transcript requests from this server's IP address. "
-        "**Fix:** upload your `cookies.txt` in the sidebar "
-        "(export it with the *Get cookies.txt* Chrome extension while logged into YouTube)."
+        "YouTube is blocking transcript requests from this server's IP. "
+        "**Fix:** add `WEBSHARE_USER` and `WEBSHARE_PASS` to your Streamlit secrets "
+        "(free account at webshare.io is enough)."
     )
 
 
