@@ -1,4 +1,6 @@
-# requirements.txt — YouTube Summarizer
-streamlit>=1.40.0
+# YT Summarizer — Python dependencies
+# Install with: pip install -r requirements.txt
+
+streamlit>=1.35.0
+requests>=2.31.0
 youtube-transcript-api>=1.0.0
-requests>=2.32.0
